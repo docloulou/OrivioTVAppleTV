@@ -452,11 +452,6 @@ final class StreamsViewModel: ObservableObject {
             // always excluded these; the selector and the global auto-play
             // (below) must too. Manual taps still offer them.
             if entry.stream.isExternal { return false }
-            // An addon that answered a byte-range request with an HTTP error
-            // cannot be cached OR seeked — the proxy fails open so the film
-            // plays, and the cache, the scrub previews and seeking are all dead
-            // for the rest of the session with nothing on screen to say so.
-            if Stream.RangeRefusingAddons.contains(entry.addonName) { return false }
             if prefs.cachedOnly && !entry.stream.isCached { return false }
             if prefs.avoidDolbyVision && entry.stream.isDolbyVision { return false }
             if let minTier, let label = entry.resolutionLabel,
@@ -509,7 +504,6 @@ final class StreamsViewModel: ObservableObject {
         // starts the wrong episode is worse than one that starts nothing.
         return autoRanked(titleFiltered(allEntries)).first { entry in
             if entry.stream.isExternal { return false }   // see autoLinkPool
-            if Stream.RangeRefusingAddons.contains(entry.addonName) { return false }
             if excluding.contains(entry.rejectionKey) { return false }
             if cachedOnly && !entry.stream.isCached { return false }
             if let re {
@@ -530,17 +524,10 @@ final class StreamsViewModel: ObservableObject {
         // Never auto-resume into an external hand-off (a "cast to DMM" style
         // entry opens another app) — resume must play a real stream here.
         //
-        // NOR INTO AN ADDON THAT HAS ALREADY PROVED IT REFUSES BYTE RANGES.
-        // The auto-pick pool has excluded those for a while; this path did not,
-        // and this is the path a Continue Watching resume takes — which is how
-        // the same cast endpoint was landed on three times in one evening after
-        // being blacklisted the first time. It plays and nothing else works:
-        // no caching, no seeking, no scrub preview.
-        //
         // Ranked, so the "base rank" the tiebreak below falls back to is the
         // best link of the FIELD rather than of the first installed addon.
         let candidates = autoRanked(titleFiltered(allEntries.filter {
-            !$0.stream.isExternal && !Stream.RangeRefusingAddons.contains($0.addonName)
+            !$0.stream.isExternal
         }))
         guard !candidates.isEmpty else { return nil }
         guard let sig = signature else { return candidates.first }
@@ -1438,7 +1425,7 @@ struct StreamsView: View {
         // Back already popped this page — never present the player from a
         // torn-down navigation entry (crashes / quits the app).
         guard !isGone else { return }
-        AppProbe.data("pick \(entry.addonName) · \(entry.stream.name) · "
+        AppProbe.data("pick \(entry.addonName) · \(entry.stream.name ?? "-") · "
             + (entry.stream.isTorrent ? "torrent" : (entry.stream.isExternal ? "cast" : "direct")))
         // Cast / open-externally stream (DMM Cast): hand the link to the system
         // rather than the in-app player. On tvOS this only succeeds for a URL

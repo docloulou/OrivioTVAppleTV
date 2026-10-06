@@ -126,6 +126,14 @@ class SubtitleDecode: DecodeProtocol {
             }
             part.image = image
             part.origin = origin
+            // Orivio: the canvas the rects are placed on. The decoder learns it
+            // from the stream (pgssubdec's presentation segment, dvdsub's
+            // extradata), and without it the overlay cannot tell a cropped
+            // caption from a full frame.
+            if let codecContext, codecContext.pointee.width > 0, codecContext.pointee.height > 0 {
+                part.canvasSize = CGSize(width: Int(codecContext.pointee.width),
+                                         height: Int(codecContext.pointee.height))
+            }
             parts.append(part)
         }
         if let attributedString {

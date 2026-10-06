@@ -136,9 +136,10 @@ final class DVSampleEngine {
     @Atomic private var activeSubtitleIndex: Int32 = -1
     func selectSubtitle(_ index: Int32?) { activeSubtitleIndex = index ?? -1 }
     /// One decoded subtitle event, delivered on MAIN:
-    /// (start, end, text, image). text==nil && image==nil is a CLEAR marker
-    /// (PGS emits explicit clears): end every part still open at `start`.
-    var onSubtitleEvent: ((Double, Double, String?, UIImage?) -> Void)?
+    /// (start, end, text, image, image origin on its canvas, canvas size).
+    /// text==nil && image==nil is a CLEAR marker (PGS emits explicit
+    /// clears): end every part still open at `start`.
+    var onSubtitleEvent: ((Double, Double, String?, UIImage?, CGPoint, CGSize) -> Void)?
     private var subDecoder: UnsafeMutablePointer<AVCodecContext>?
     private var subDecoderIndex: Int32 = -1
     /// Rolling raw-packet buffer for EVERY subtitle stream (demux thread
@@ -2512,11 +2513,21 @@ final class DVSampleEngine {
         }
         guard start >= 0 else { return }
         if sub.num_rects == 0 {   // explicit clear (PGS)
-            DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, start, nil, nil) }
+            DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, start, nil, nil, .zero, .zero) }
             return
         }
         var texts: [String] = []
         var image: UIImage?
+        // Where the bitmap sits on its authoring canvas, and that canvas — the
+        // overlay needs both to draw a cropped PGS caption at its real size.
+        var imageOrigin = CGPoint.zero
+        // EVERY bitmap rect, not the first: a PGS event routinely carries two
+        // (a caption line and a sign, or two lines placed apart), and keeping
+        // only the first silently dropped the rest.
+        var bitmaps: [(rect: CGRect, image: CGImage)] = []
+        let canvas = decoder.pointee.width > 0 && decoder.pointee.height > 0
+            ? CGSize(width: Int(decoder.pointee.width), height: Int(decoder.pointee.height))
+            : .zero
         for i in 0 ..< Int(sub.num_rects) {
             guard let rect = sub.rects[i]?.pointee else { continue }
             switch rect.type {
@@ -2531,15 +2542,43 @@ final class DVSampleEngine {
                     if !line.isEmpty { texts.append(line) }
                 }
             case SUBTITLE_BITMAP:
-                if image == nil { image = Self.imageFromSubtitleRect(rect) }
+                if let cg = Self.imageFromSubtitleRect(rect)?.cgImage {
+                    bitmaps.append((CGRect(x: Int(rect.x), y: Int(rect.y),
+                                           width: Int(rect.w), height: Int(rect.h)), cg))
+                }
             default:
                 break
+            }
+        }
+        if bitmaps.count == 1 {
+            image = UIImage(cgImage: bitmaps[0].image)
+            imageOrigin = bitmaps[0].rect.origin
+        } else if bitmaps.count > 1 {
+            // One image over the union of the rects, origin at its corner — the
+            // overlay places it on the canvas exactly like a single rect.
+            let union = bitmaps.dropFirst().reduce(bitmaps[0].rect) { $0.union($1.rect) }
+            if let ctx = CGContext(data: nil, width: Int(union.width), height: Int(union.height),
+                                   bitsPerComponent: 8, bytesPerRow: 0,
+                                   space: CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                for bitmap in bitmaps {
+                    // CoreGraphics' origin is bottom-left; the rects are top-left.
+                    ctx.draw(bitmap.image, in: CGRect(
+                        x: bitmap.rect.minX - union.minX,
+                        y: union.maxY - bitmap.rect.maxY,
+                        width: bitmap.rect.width, height: bitmap.rect.height))
+                }
+                if let composite = ctx.makeImage() {
+                    image = UIImage(cgImage: composite)
+                    imageOrigin = union.origin
+                }
             }
         }
         let text = texts.isEmpty ? nil : texts.joined(separator: "\n")
         guard text != nil || image != nil else { return }
         let img = image
-        DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, end, text, img) }
+        let origin = imageOrigin
+        DispatchQueue.main.async { [weak self] in self?.onSubtitleEvent?(start, end, text, img, origin, canvas) }
     }
 
     /// FFmpeg's decoded ASS event: "ReadOrder,Layer,Style,Name,MarginL,

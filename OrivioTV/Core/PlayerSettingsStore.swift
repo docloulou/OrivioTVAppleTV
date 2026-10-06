@@ -175,6 +175,11 @@ struct PlayerSettings: Codable, Equatable {
     var subtitleSecondaryLanguage: String = ""
     /// Prefer a "forced" subtitle track (foreign-dialogue only) when one exists.
     var subtitlePreferForced: Bool = false
+    /// Let subtitle-addon tracks (SubMaker, OpenSubtitles…) win over the
+    /// file's own tracks in the same language. The automatic pick then waits
+    /// for the addon wave instead of settling on the embedded track that lands
+    /// first. Off = the file's own track wins, as before.
+    var preferAddonSubtitles: Bool = false
     // --- Styling ---
     /// Caption text color (hex, no #).
     var subtitleTextColorHex: String = "FFFFFF"
@@ -518,6 +523,7 @@ struct PlayerSettings: Codable, Equatable {
         preferredSubtitleLanguage = (try? c.decode(String.self, forKey: .preferredSubtitleLanguage)) ?? d.preferredSubtitleLanguage
         subtitleSecondaryLanguage = (try? c.decode(String.self, forKey: .subtitleSecondaryLanguage)) ?? d.subtitleSecondaryLanguage
         subtitlePreferForced = (try? c.decode(Bool.self, forKey: .subtitlePreferForced)) ?? d.subtitlePreferForced
+        preferAddonSubtitles = (try? c.decode(Bool.self, forKey: .preferAddonSubtitles)) ?? d.preferAddonSubtitles
         subtitleTextColorHex = (try? c.decode(String.self, forKey: .subtitleTextColorHex)) ?? d.subtitleTextColorHex
         subtitleOutlineEnabled = (try? c.decode(Bool.self, forKey: .subtitleOutlineEnabled)) ?? d.subtitleOutlineEnabled
         subtitleOutlineColorHex = (try? c.decode(String.self, forKey: .subtitleOutlineColorHex)) ?? d.subtitleOutlineColorHex

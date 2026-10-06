@@ -76,6 +76,18 @@ final class MediaCacheServer {
     /// Cleared when the CDN refuses it (the signed URL expired or was
     /// revoked) so the next request re-resolves through `origin` once.
     private var resolvedOrigin: URL?
+    /// The resolved URL the CDN last refused. Every worker in flight was
+    /// fetching it, so their refusals arrive one after another; only the
+    /// first finds `resolvedOrigin` still set. The rest used to fall through
+    /// to `failSession` and drop the whole title to direct playback the moment
+    /// a signed link expired — on a long film, routinely. Matching a refusal
+    /// against this marks it as the same stale link, and keeps a late 206 from
+    /// it from being adopted again.
+    private var staleResolvedOrigin: URL?
+    /// Retries spent on refusals of `staleResolvedOrigin`. Bounded because an
+    /// add-on that keeps redirecting to the SAME dead link would otherwise be
+    /// asked again every 0.5s for as long as the session lives.
+    private var staleLinkRetries = 0
     /// The URL a new origin request should go to.
     fileprivate var fetchURL: URL? { resolvedOrigin ?? origin }
     /// Addon-declared request headers (Referer/User-Agent/Cookie/…) for the
@@ -931,6 +943,8 @@ final class MediaCacheServer {
             guard startListenerLocked() else { return nil }
             self.origin = origin
             resolvedOrigin = nil
+            staleResolvedOrigin = nil
+            staleLinkRetries = 0
             sessionHeaders = headers
             token = UUID().uuidString
             redirectAll = false
@@ -1068,6 +1082,8 @@ final class MediaCacheServer {
         fileURL = nil
         origin = nil
         resolvedOrigin = nil
+        staleResolvedOrigin = nil
+        staleLinkRetries = 0
         sessionHeaders = nil
         token = ""
         ranges = []
@@ -1676,6 +1692,7 @@ final class MediaCacheServer {
             // to be assigned to it, which is the worse case and the one this
             // used to skip. Kick unconditionally; the pool's own preemption
             // cooldown keeps it from thrashing at the 80ms poll rate.
+            if mediaRead { rescueSilentFrontier() }
             if !pausedForSpace { kickPool() }
             q.asyncAfter(deadline: .now() + 0.08) { [weak self] in
                 self?.serve(connection, reader: reader, offset: offset,
@@ -1697,6 +1714,7 @@ final class MediaCacheServer {
                 if mediaRead {
                     self.reapStalledWorkers()
                     self.unblockFrontier()
+                    self.rescueSilentFrontier()
                     self.reapAbandonedReaders()
                     self.noteRead(connection, next)
                     self.kickPoolIfIdle()
@@ -1925,10 +1943,28 @@ final class MediaCacheServer {
             // one); forget it and let this worker go back through the add-on,
             // which answers with a fresh redirect. A refusal of the add-on's
             // OWN url still falls through to the failure below.
-            if resolvedOrigin != nil, [401, 403, 404, 410].contains(status) {
+            let refusedURL = response.url
+            // 400 is in the set because TorBox's CDN answers an EXPIRED signed
+            // link with 400, not 403 — seen on the device after a 20-hour sleep
+            // on a paused film: three retries of the dead link, the add-on
+            // written off as "refuses byte ranges", and a failover that lost
+            // Dolby Vision and started playing on its own. Only the RESOLVED
+            // URL is treated this way; a 400 from the add-on's own URL still
+            // fails below.
+            let staleLinkStatuses: Set<Int> = [400, 401, 403, 404, 410]
+            // A sibling's refusal of the link that was ALREADY found stale:
+            // the re-resolve is under way, so this worker just tries again.
+            if staleLinkStatuses.contains(status), let stale = staleResolvedOrigin,
+               let refusedURL, refusedURL == stale, refusedURL != resolvedOrigin,
+               staleLinkRetries < 12 {
+                staleLinkRetries += 1
+                return .retryLater(0.5)
+            }
+            if resolvedOrigin != nil, staleLinkStatuses.contains(status) {
                 requestTrail("resolved URL refused (\(status)) — re-resolving through the add-on",
                              important: true)
                 PlayerProbe.event("cache", "resolved URL refused (\(status)) — re-resolving")
+                staleResolvedOrigin = resolvedOrigin
                 resolvedOrigin = nil
                 return .retryLater(0.5)
             }
@@ -1965,9 +2001,10 @@ final class MediaCacheServer {
     /// response — see `resolvedOrigin`.
     private func adoptResolvedOrigin(_ response: HTTPURLResponse) {
         guard resolvedOrigin == nil, let origin, let final = response.url,
-              final != origin, let scheme = final.scheme?.lowercased(),
+              final != origin, final != staleResolvedOrigin, let scheme = final.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else { return }
         resolvedOrigin = final
+        staleLinkRetries = 0
         requestTrail("resolved \(origin.host ?? "?") → \(final.host ?? "?") — pool fetches go direct",
                      important: true)
         PlayerProbe.event("cache", "resolved \(origin.host ?? "?") → \(final.host ?? "?")")
@@ -2077,6 +2114,18 @@ final class MediaCacheServer {
             } else {
                 self.kickPool()
             }
+        }
+    }
+
+    /// A worker coming back from its retry back-off may pick its segment up
+    /// again only if nobody else has, it is not already on disk, and the pool
+    /// is still downloading at all.
+    fileprivate func shouldResumeRetry(_ worker: SegmentDownloader, at offset: Int64) -> Bool {
+        guard !redirectAll, !pausedForSpace, writeHandle != nil else { return false }
+        if totalLength > 0, coverageEnd(from: offset) > offset { return false }
+        return !workers.contains { other in
+            guard other !== worker, let pending = other.pendingSegment else { return false }
+            return pending.start <= offset && offset < pending.end
         }
     }
 
@@ -2275,6 +2324,83 @@ final class MediaCacheServer {
         requestTrail("UNBLOCK FRONTIER at \(edge) (edge +\(edgeGain), pool +\(poolGain))",
                      important: true)
         blocker.cancelSegment()
+        kickPool()
+    }
+
+    /// Cooldown between silent-frontier rescues.
+    private var lastFrontierRescueAt = Date.distantPast
+    /// A connection that has delivered bytes and then gone this long without
+    /// another megabyte is dead weight at the frontier.
+    private static let frontierSilenceSeconds: CFAbsoluteTime = 4
+    /// Allowance for a brand-new request's first byte (time to first byte on
+    /// a debrid CDN is routinely a second or two, occasionally several).
+    private static let frontierFirstByteSeconds: CFAbsoluteTime = 8
+
+    /// Re-open the chunk at the contiguous edge when the ONE connection
+    /// holding it has gone quiet while the rest of the pool is downloading.
+    ///
+    /// The shape behind "the cache bar freezes, the video judders, then the
+    /// bar jumps far ahead": a player can only advance through bytes
+    /// contiguous with what it is reading, so the edge sits on a single 16 MB
+    /// chunk on a single connection. When that connection stalls, every other
+    /// worker keeps tiling forward and `onDisk` keeps climbing — but the bar
+    /// (the contiguous edge) stands still, the reader drains its lead up to the
+    /// hole and waits there (the judder), and only when the dead connection
+    /// finally times out and retries does the chunk land and the edge leap
+    /// over everything the pool fetched in the meantime.
+    ///
+    /// Nothing else caught it. `reapStalledWorkers` judges the POOL's write
+    /// heartbeat, which the healthy workers keep fresh, so a single silent one
+    /// is never reaped; URLSession's own idle timeout is 30 seconds;
+    /// `preemptForStarvedReader` sees the waiting reader's bytes "arriving
+    /// soon" from that same silent worker and leaves it be; and
+    /// `unblockFrontier` stands down whenever the lead is under the burst
+    /// target — which is exactly the state a stuck frontier drives the lead
+    /// into.
+    ///
+    /// Patience scales with the evidence. When another connection made
+    /// progress in the last two seconds the link is demonstrably fine and only
+    /// this one is dead, so four seconds of silence is enough. Otherwise the
+    /// allowance doubles — unless a reader is already WAITING on the edge, in
+    /// which case every second of patience is a second of frozen picture. That
+    /// "otherwise" case is not rare: once the pool reaches its lead ceiling the
+    /// silent chunk is often the ONLY thing in flight, and requiring a healthy
+    /// sibling there meant waiting out the 30-second idle timeout (seen in the
+    /// harness: the reader caught the hole and sat on it). The bytes the
+    /// worker already received are kept (`cancelSegment` flushes them), and the
+    /// re-request goes out on a fresh connection.
+    private func rescueSilentFrontier() {
+        guard rangeCapable, !redirectAll, !pausedForSpace, writeHandle != nil,
+              totalLength > 0 else { return }
+        guard Date().timeIntervalSince(lastFrontierRescueAt) > 3 else { return }
+        let edge = coverageEnd(from: liveReadAnchor())
+        guard edge < totalLength else { return }
+        guard let blocker = workers.first(where: {
+            guard let segment = $0.pendingSegment else { return false }
+            return segment.start <= edge && edge < segment.end
+        }) else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let silentFor = now - blocker.progressMarkAt
+        var allowance = blocker.hasReceivedBytes
+            ? Self.frontierSilenceSeconds : Self.frontierFirstByteSeconds
+        let siblingProgressing = workers.contains(where: {
+            $0 !== blocker && $0.pendingSegment != nil && $0.hasReceivedBytes
+                && now - $0.progressMarkAt < 2
+        })
+        let readerWaiting = Date().timeIntervalSince(lastReaderWaitAt) < 2
+        if !siblingProgressing, !readerWaiting { allowance *= 2 }
+        guard silentFor > allowance else { return }
+        lastFrontierRescueAt = Date()
+        PlayerProbe.event("cache", "frontier connection SILENT at \(edge / 1_048_576)MB for"
+            + String(format: " %.1fs", silentFor)
+            + (blocker.hasReceivedBytes ? "" : " (no first byte)")
+            + (readerWaiting ? ", reader waiting" : "")
+            + (siblingProgressing ? ", pool still downloading" : "")
+            + " — re-opening that chunk on a fresh connection")
+        requestTrail(String(format: "RESCUE SILENT FRONTIER at %lld (silent %.1fs)", edge, silentFor),
+                     important: true)
+        blocker.cancelSegment()
+        blocker.freshConnection()
         kickPool()
     }
 
@@ -3379,6 +3505,18 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
     /// waiting reader's shortfall apart from a genuinely stranded one.
     var bufferedBytes: Int { buffer.count }
 
+    /// When this worker last made REAL progress on its segment: its first
+    /// byte, then every further megabyte. A connection trickling a few KB a
+    /// second keeps `lastWriteAt` (the pool-wide heartbeat) fresh while being
+    /// no use at all to a reader parked in front of it, so the pool needs a
+    /// per-connection measure to tell the two apart — see
+    /// `rescueSilentFrontier`.
+    private(set) var progressMarkAt = CFAbsoluteTimeGetCurrent()
+    /// The current segment has delivered at least one byte.
+    private(set) var hasReceivedBytes = false
+    private var bytesSinceMark = 0
+    private static let progressMarkBytes = 1_048_576
+
     /// Push whatever is held out to disk now (on q). Called when a reader is
     /// waiting on the very bytes this worker is sitting on.
     func flushNow() { flush() }
@@ -3408,6 +3546,10 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         self.headers = headers
         self.q = queue
         super.init()
+        session = makeSession()
+    }
+
+    private func makeSession() -> URLSession {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30       // idle, not total
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -3415,9 +3557,22 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         // URLCache take a second copy is pure overhead.
         config.urlCache = nil
         let delegateQueue = OperationQueue()
-        delegateQueue.underlyingQueue = queue
+        delegateQueue.underlyingQueue = q
         delegateQueue.maxConcurrentOperationCount = 1
-        session = URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
+        return URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
+    }
+
+    /// Drop this worker's connection and open the next segment on a new one
+    /// (on q). Cancelling a task is not enough when it is the CONNECTION that
+    /// went quiet: a session keeps its sockets, and on HTTP/2 the replacement
+    /// request would ride the same stalled TCP stream. Call after
+    /// `cancelSegment`, which keeps whatever had arrived.
+    func freshConnection() {
+        task?.cancel()
+        task = nil
+        discardBuffer()
+        session.invalidateAndCancel()
+        session = makeSession()
     }
 
     /// Begin (or re-begin) downloading from `offset` (on q).
@@ -3425,6 +3580,9 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         task?.cancel()
         discardBuffer()
         lastFlush = CFAbsoluteTimeGetCurrent()
+        progressMarkAt = lastFlush
+        hasReceivedBytes = false
+        bytesSinceMark = 0
         segmentEnd = endExclusive
         requestedOffset = offset
         writeOffset = offset
@@ -3490,6 +3648,12 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !cancelled, dataTask === task, server != nil else { return }
         buffer.append(data)
+        bytesSinceMark += data.count
+        if !hasReceivedBytes || bytesSinceMark >= Self.progressMarkBytes {
+            hasReceivedBytes = true
+            progressMarkAt = CFAbsoluteTimeGetCurrent()
+            bytesSinceMark = 0
+        }
         if buffer.count >= Self.flushBytes
             || CFAbsoluteTimeGetCurrent() - lastFlush >= Self.flushSeconds {
             flush()
@@ -3523,6 +3687,17 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
             self.task = nil   // not busy while it waits, so the pool can plan
             q.asyncAfter(deadline: .now() + Double(retries)) { [weak self] in
                 guard let self, !self.cancelled, self.task == nil else { return }
+                // ASK BEFORE RESUMING. While this worker waited, its bytes were
+                // unclaimed — on purpose, so the pool can plan — and the pool
+                // routinely handed the very same gap to an idle sibling, so the
+                // retry then fetched it a second time (seen: the same range
+                // requested twice a second apart). Also covers the pool having
+                // parked for space or failed open in the meantime.
+                guard let server = self.server,
+                      server.shouldResumeRetry(self, at: offset) else {
+                    self.server?.downloaderFinishedSegment(self)
+                    return
+                }
                 self.start(at: offset, endExclusive: end)
             }
             return

@@ -679,11 +679,12 @@ list is the torrent's own in original order. Premiumize, TorBox and AllDebrid fi
 renumber, so a naive mapping plays the wrong file; those fall back to an
 SxxExx-then-largest heuristic.
 
-`Stream.RangeRefusingAddons` (persisted, key bumped to `.v2`) records an add-on whose links
-answer an HTTP **status** to a range GET after all recovery attempts — never on **416**
-(Range Not Satisfiable means *our* range was wrong) and never on a dropped connection. A
-server that genuinely can't do ranges answers **200 with the whole body**. Both auto-pick
-filters exclude a listed add-on; manual taps still play it.
+An origin that answers an HTTP **status** to a range GET after all recovery attempts —
+never on **416** (Range Not Satisfiable means *our* range was wrong) and never on a dropped
+connection — fails the current film over to another source. Nothing is remembered: the
+persistent per-add-on blacklist (`Stream.RangeRefusingAddons`) was removed on 2026-10-03
+after it wrote off Comet for an expired TorBox link (400). A server that genuinely can't
+do ranges answers **200 with the whole body**.
 
 ### 6.4 Torrents
 
@@ -2002,7 +2003,6 @@ Nothing below is a secret; all of it is honest state at handoff.
   left.
 * The idle full-screen backdrop trailer dissolves the Detail page ~9 s in (measured, real,
   left unchanged pending a product call). Workaround: Playback → auto-play trailer delay = 0.
-* `RangeRefusingAddons` is permanent, global, with no TTL and no reset.
 * Dead settings (from `SETTINGS_REFERENCE.md`): **Hide torrent stats** (persisted, never
   read); model fields `pauseOverlayEnabled`, `osdClockEnabled`, `fullscreenHero` (the last
   is even synced to the account but no view reads it); `OrivioPlayerOptions.matchFrameRate`.

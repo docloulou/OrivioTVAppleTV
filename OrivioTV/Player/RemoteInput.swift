@@ -165,3 +165,75 @@ final class MenuHostView: UIView, UIGestureRecognizerDelegate {
         onMenu()
     }
 }
+
+/// Captures Play/Pause at the WINDOW level, for the same reason
+/// `RemoteMenuCatcher` exists: SwiftUI's `onPlayPauseCommand` only fires while
+/// focus sits inside the player's hierarchy, and every overlay change hands
+/// focus over through a moment where it sits NOWHERE — measured on the device
+/// at 50-850ms each time the transport comes up after a pause. A press in that
+/// gap reached no handler at all, which is "pause sometimes takes two presses".
+///
+/// Unlike the Menu catcher this one does not make other recognizers wait for
+/// it and does not cancel the press, so `onPlayPauseCommand` still sees every
+/// press it saw before; `PlayerViewModel.playPausePressed(from:)` folds the
+/// two deliveries of one press back into one.
+struct RemotePlayPauseCatcher: UIViewRepresentable {
+    let onPlayPause: () -> Void
+
+    func makeUIView(context: Context) -> PlayPauseHostView {
+        let view = PlayPauseHostView()
+        view.onPlayPause = onPlayPause
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayPauseHostView, context: Context) {
+        uiView.onPlayPause = onPlayPause
+    }
+
+    static func dismantleUIView(_ uiView: PlayPauseHostView, coordinator: ()) {
+        uiView.removeRecognizer()
+    }
+}
+
+final class PlayPauseHostView: UIView, UIGestureRecognizerDelegate {
+    var onPlayPause: () -> Void = {}
+
+    private var recognizer: UITapGestureRecognizer?
+    private weak var attachedWindow: UIWindow?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        removeRecognizer()
+        guard let window else { return }
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handlePlayPause))
+        tap.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
+        // Observe, never intercept: the press still reaches the focused view.
+        tap.cancelsTouchesInView = false
+        tap.delaysTouchesBegan = false
+        tap.delaysTouchesEnded = false
+        tap.delegate = self
+        window.addGestureRecognizer(tap)
+        recognizer = tap
+        attachedWindow = window
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
+    }
+
+    func removeRecognizer() {
+        if let recognizer, let attachedWindow {
+            attachedWindow.removeGestureRecognizer(recognizer)
+        }
+        recognizer = nil
+        attachedWindow = nil
+    }
+
+    @objc private func handlePlayPause() {
+        PlayerProbe.event("remote", "⏯ (window recognizer)")
+        onPlayPause()
+    }
+}

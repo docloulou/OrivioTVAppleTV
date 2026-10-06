@@ -39,7 +39,11 @@ struct FusionHeroBar: View {
     // common-mode timers fire inside the run-loop tracking mode focus/scroll
     // animations run in, waking SwiftUI mid-scroll on the A8 for a check that
     // is never urgent.
-    private let tick = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
+    /// STATIC — one timer for the process. Held as an instance `let`, a new
+    /// autoconnected timer was built every time the parent re-created this
+    /// view, and `onReceive` re-subscribed to it: each parent redraw restarted
+    /// the countdown, so frequent redraws could hold the tick off entirely.
+    private static let tick = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
 
     /// Near-black graphite used by the left readability scrim (§4.3).
     private static let scrim = Color(hex: 0x06080A)
@@ -63,7 +67,7 @@ struct FusionHeroBar: View {
         .onChange(of: items.map(\.id)) { _, _ in
             if !items.indices.contains(index) { index = 0 }
         }
-        .onReceive(tick) { _ in rotateIfIdle() }
+        .onReceive(Self.tick) { _ in rotateIfIdle() }
         .contentRating(for: current, into: $contentRating)
     }
 

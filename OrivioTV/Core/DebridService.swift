@@ -934,16 +934,29 @@ enum DebridService {
         struct UploadMagnet: Decodable { let id: Int?; let ready: Bool? }
         struct StatusResponse: Decodable { let data: StatusData? }
         struct StatusData: Decodable { let magnets: StatusMagnet? }
-        struct StatusMagnet: Decodable { let status: String?; let links: [StatusLink]? }
+        struct StatusMagnet: Decodable { let status: String?; let links: [StatusLink]?; let uploadDate: Double? }
         struct StatusLink: Decodable { let link: String?; let filename: String?; let size: Int64? }
         struct UnlockResponse: Decodable { let data: UnlockData? }
         struct UnlockData: Decodable { let link: String? }
 
+        let uploadedAt = Date()
         let upload: UploadResponse = try await adGET("magnet/upload", apiKey: apiKey, query: ["magnets[]": magnet])
         guard let id = upload.data?.magnets?.first?.id else { return .notCached }
         let status: StatusResponse = try await adGET("magnet/status", apiKey: apiKey, query: ["id": String(id)])
         guard status.data?.magnets?.status?.lowercased() == "ready",
               let links = status.data?.magnets?.links, !links.isEmpty else {
+            // TAKE IT BACK OUT. Uploading an uncached magnet doesn't just ask —
+            // AllDebrid starts DOWNLOADING it into the user's account, and
+            // `resolveAcross` tries every provider, so each miss elsewhere left
+            // another torrent there (Real-Debrid's path deletes its own on any
+            // failure; TorBox adds only when cached). Removed ONLY when this
+            // resolve created it: uploading a magnet the account already holds
+            // returns that entry, and a download the user started themselves
+            // must survive — its upload date is older than this request.
+            if let uploaded = status.data?.magnets?.uploadDate,
+               uploaded >= uploadedAt.timeIntervalSince1970 - 120 {
+                Task { _ = try? await adGET("magnet/delete", apiKey: apiKey, query: ["id": String(id)]) as AnyDecodable }
+            }
             return .notCached
         }
         // No `torrentIndex` for AllDebrid: `magnet/status` returns the LINKS it
@@ -1026,6 +1039,11 @@ enum DebridService {
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = body
         return try await decode(request)
+    }
+
+    /// Accepts any JSON reply — for calls whose answer is not used.
+    private struct AnyDecodable: Decodable {
+        init(from decoder: Decoder) throws {}
     }
 
     private static func adGET<T: Decodable>(_ path: String, apiKey: String, query: [String: String]) async throws -> T {

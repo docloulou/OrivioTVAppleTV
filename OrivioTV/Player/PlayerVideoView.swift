@@ -124,16 +124,11 @@ struct SubtitleOverlayView: View {
     var body: some View {
         ZStack {
             // Bitmap cues (PGS/VobSub) are pre-rendered images that carry their
-            // own layout; left exactly as they were.
+            // own layout — see `bitmapCue`.
             ForEach(model.parts.filter { $0.image != nil }) { part in
                 if let image = part.image {
                     GeometryReader { geo in
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(maxWidth: geo.size.width * 0.9)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                            .padding(.bottom, 60)
+                        bitmapCue(image, part: part, in: geo.size)
                     }
                 }
             }
@@ -170,6 +165,45 @@ struct SubtitleOverlayView: View {
             }
         }
         .allowsHitTesting(false)
+    }
+
+    /// A PGS/VobSub caption at the size and place its author drew it.
+    ///
+    /// The decoders hand over the caption CROPPED to its own pixels (a line of
+    /// text a few hundred pixels tall) plus where that crop sits on the
+    /// authoring canvas — 1920x1080 for a Blu-ray, 720x480 for a DVD. This used
+    /// to be `.resizable().scaledToFit()` into 90% of the screen width, which
+    /// blew the cropped line up until it hit the screen edges: "embedded
+    /// subtitles fill the whole screen", on every remux, since that is where
+    /// PGS lives. Scaled by canvas-to-screen instead, a Blu-ray caption on a
+    /// 1080p UI is drawn 1:1.
+    @ViewBuilder
+    private func bitmapCue(_ image: UIImage, part: SubtitlePart, in size: CGSize) -> some View {
+        let pixels = CGSize(width: image.size.width * image.scale,
+                            height: image.size.height * image.scale)
+        let canvas = part.canvasSize
+        if canvas.width > 0, canvas.height > 0, size.width > 0, size.height > 0 {
+            // Canvas fitted to the screen, exactly as the video frame is.
+            let scale = min(size.width / canvas.width, size.height / canvas.height)
+            let left = (size.width - canvas.width * scale) / 2 + part.origin.x * scale
+            let top = (size.height - canvas.height * scale) / 2 + part.origin.y * scale
+            let w = pixels.width * scale, h = pixels.height * scale
+            Image(uiImage: image)
+                .resizable()
+                .frame(width: w, height: h)
+                .position(x: left + w / 2, y: top + h / 2)
+        } else {
+            // No canvas from the decoder: assume Blu-ray authoring (1920 wide,
+            // or 3840 for an image too big to be one) and keep the old bottom
+            // placement — sized, never stretched to the screen.
+            let assumed: CGFloat = pixels.width > 1920 ? 3840 : 1920
+            let scale = size.width / assumed
+            Image(uiImage: image)
+                .resizable()
+                .frame(width: pixels.width * scale, height: pixels.height * scale)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 60)
+        }
     }
 
     /// One caption: the broadcast look, styled from Playback settings — text

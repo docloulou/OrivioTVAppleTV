@@ -367,6 +367,7 @@ instance on the network.
 | Preferred language | Dropdown | Chosen automatically when the stream has a match | Wired |
 | Secondary language | Dropdown | Used when the preferred language isn't available | Wired |
 | Prefer forced subtitles | Switch | Chooses a forced track (foreign dialogue only) when one exists in your language | Wired |
+| Prefer add-on subtitles | Switch | Chooses a subtitle add-on's track (SubMaker, OpenSubtitles…) over the file's own track in the same language; the pick waits for the add-ons to answer | Wired |
 | Text size | Dropdown | Caption size | Wired |
 | Font | Dropdown | Caption typeface. Also adjustable live in the player | Wired |
 | Timing offset | Dropdown | Shifts captions earlier (−) or later (+). Adjustable live | Wired |

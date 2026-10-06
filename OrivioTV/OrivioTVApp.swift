@@ -305,7 +305,11 @@ struct RootView: View {
     /// for a poll that is never urgent. Tier-scaled: on the A8/A10X the full
     /// account sync already runs every 90s, and a second independent 30s pull
     /// over the same data doubled the recurring decode/merge load for nothing.
-    private let continueWatchingPoll = Timer.publish(
+    /// STATIC — one timer for the process. Held as an instance `let`, a new
+    /// autoconnected timer was built every time the parent re-created this
+    /// view, and `onReceive` re-subscribed to it: each parent redraw restarted
+    /// the countdown, so frequent redraws could hold the tick off entirely.
+    private static let continueWatchingPoll = Timer.publish(
         every: (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? 60 : 30,
         on: .main, in: .default
     ).autoconnect()
@@ -356,6 +360,9 @@ struct RootView: View {
                 startPlayerDemoIfRequested()
                 startDetailDemoIfRequested()
                 ScrubThumbnailer.runSelfTestIfRequested()
+                #if DEBUG
+                TrailerResolver.runSelfTestIfRequested()
+                #endif
             }
             .task {
                 if sync == nil {
@@ -859,7 +866,7 @@ struct RootView: View {
             // Keep Continue Watching live while browsing Home (tab 0), app
             // active, no player open. refreshContinueWatching pulls a full
             // snapshot; mergeRemote reconciles both adds and removes.
-            .onReceive(continueWatchingPoll) { _ in
+            .onReceive(Self.continueWatchingPoll) { _ in
                 guard scenePhase == .active, selectedTab == 0, playback == nil else { return }
                 sync?.refreshContinueWatching()
             }

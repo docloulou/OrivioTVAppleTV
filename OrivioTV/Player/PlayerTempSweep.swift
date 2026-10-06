@@ -192,11 +192,28 @@ enum PlayerProbe {
     /// `String(format:)` per call there is real work for a log nobody can read.
     nonisolated static func event(_ tag: String, _ line: @autoclosure () -> String) {
         guard ProbeGate.isEnabled else { return }
+        let text = redactingTokens(line())
         lock.lock()
-        ring.append((nextSeq, Date(), tag, line()))
+        ring.append((nextSeq, Date(), tag, text))
         nextSeq &+= 1
         if ring.count > capacity { ring.removeFirst(ring.count - capacity) }
         lock.unlock()
+    }
+
+    /// Credentials that ride in URL queries — a Plex server token, a Jellyfin
+    /// or TMDB `api_key` — masked before a line enters the ring. The ring is
+    /// served in plain text over the LAN (`:8123`) and copied into
+    /// recordings, and a stream or artwork URL logged whole carried the
+    /// viewer's server token with it.
+    private static let tokenPattern = try? NSRegularExpression(
+        pattern: #"((?:X-Plex-Token|api_key|apikey)=)[^&\s"'<>]+"#, options: [.caseInsensitive])
+
+    nonisolated static func redactingTokens(_ line: String) -> String {
+        guard let regex = tokenPattern,
+              line.range(of: "token=", options: .caseInsensitive) != nil
+                || line.range(of: "key=", options: .caseInsensitive) != nil else { return line }
+        return regex.stringByReplacingMatches(
+            in: line, range: NSRange(line.startIndex..., in: line), withTemplate: "$1••••")
     }
 
     /// Events newer than `seq`, formatted, with the sequence to ask from next.
@@ -631,8 +648,22 @@ enum FlightRecorder {
         //
         // WRITTEN THROUGH `queue` like every other write, so the first tick
         // cannot race the reset and lose itself.
+        //
+        // BUT KEEP THE PREVIOUS RUN'S TAIL, under its own key. A memory kill
+        // (jetsam) writes no crash report the app can see and leaves no probe
+        // history, so the only record of the minutes before it was this ring —
+        // and the relaunch wiped it first thing (2026-10-02: killed at 1.5 GB,
+        // the reset erased every tick that would have said what grew).
+        // `dev.flight.previous` = the last 15 minutes of the run before this one
+        // (90 ticks, ~18 KB — the defaults domain has a ~1 MB budget).
         let opening = line(mainStall: 0, note: "=== launch ===")
-        queue.async { UserDefaults.standard.set([opening], forKey: key) }
+        queue.async {
+            let defaults = UserDefaults.standard
+            if let last = defaults.stringArray(forKey: key), !last.isEmpty {
+                defaults.set(Array(last.suffix(90)), forKey: key + ".previous")
+            }
+            defaults.set([opening], forKey: key)
+        }
 
         // Main-thread heartbeat. All it does is stamp the clock; if the main
         // thread is blocked this simply stops happening and the tick below sees

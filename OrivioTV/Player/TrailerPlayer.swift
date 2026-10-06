@@ -199,6 +199,14 @@ enum TrailerResolver {
     /// matching User-Agent, and AVPlayer's default UA gets "Cannot Open"
     /// (-11828). Rebuild each request with the extracting client's UA.
     private static func asset(for url: URL) -> AVURLAsset {
+        AVURLAsset(url: url, options: [
+            "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": userAgent(for: url)]
+        ])
+    }
+
+    /// The User-Agent googlevideo expects for a URL — the one matching the
+    /// InnerTube client that minted it (see `asset(for:)`).
+    fileprivate static func userAgent(for url: URL) -> String {
         let client = URLComponents(url: url, resolvingAgainstBaseURL: false)?
             .queryItems?.first(where: { $0.name == "c" })?.value
         let userAgent: String
@@ -234,9 +242,7 @@ enum TrailerResolver {
             // browser clients — a browser agent is the matching one.
             userAgent = "Mozilla/5.0"
         }
-        return AVURLAsset(url: url, options: [
-            "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": userAgent]
-        ])
+        return userAgent
     }
 
     /// Merge a remote video-only and audio-only track into one playable asset.
@@ -249,6 +255,17 @@ enum TrailerResolver {
     /// one caller (`playerItem`) is already reached from a `.task` on main.
     @MainActor
     private static func mergedItem(video: URL, audio: URL) async -> AVPlayerItem? {
+        // STREAM IT. The composition below needs both tracks' complete sample
+        // tables, and YouTube's adaptive files are fragmented MP4s — so
+        // AVFoundation downloads the ENTIRE video file before it will hand the
+        // track over: 10.2s for a 1080p trailer on a link doing 5 MB/s
+        // (measured 2026-10-02). Since YouTube stopped serving muxed streams,
+        // every trailer went through that wait, and the Home hero gives up at
+        // 12s — so trailers "didn't load". The same two files described as an
+        // HLS presentation start from their first fragment instead.
+        if let streamed = await DashAsHLS.item(video: video, audio: audio) {
+            return budgeted(streamed)
+        }
         let videoAsset = asset(for: video)
         let audioAsset = asset(for: audio)
         let composition = AVMutableComposition()
@@ -259,7 +276,6 @@ enum TrailerResolver {
             // which is why the muxed stream (and its 720p ceiling) used to be
             // preferred outright.
             async let videoTracks = videoAsset.loadTracks(withMediaType: .video)
-            async let videoDuration = videoAsset.load(.duration)
             async let audioTracks = audioAsset.loadTracks(withMediaType: .audio)
 
             guard let vTrack = try await videoTracks.first else { return nil }
@@ -269,9 +285,19 @@ enum TrailerResolver {
             // its real end and the composition then ran on over nothing for
             // the same time again — a frozen picture and a spinner half way
             // through the timeline. The URL's own `dur` is the real length.
-            var duration = try await videoDuration
-            if let declared = declaredDuration(of: video), declared < duration {
+            //
+            // AND ASKING FOR THE ASSET'S DURATION IS WHAT MADE TRAILERS NOT
+            // LOAD. These are fragmented MP4s: AVFoundation answers `.duration`
+            // (and an audio track's `.timeRange`) by walking the fragments, and
+            // that walk took the merge to 10-11 SECONDS (measured 2026-10-02,
+            // `-trailerSelfTest`) — past the Home hero's 12s give-up, so the
+            // hero trailer never started. The declared `dur` is the real
+            // length; the slow load runs only when a URL carries none.
+            let duration: CMTime
+            if let declared = declaredDuration(of: video) {
                 duration = declared
+            } else {
+                duration = try await videoAsset.load(.duration)
             }
             let range = CMTimeRange(start: .zero, duration: duration)
             let vComp = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
@@ -281,7 +307,12 @@ enum TrailerResolver {
                 // The audio track can be a hair shorter than the video; clamp
                 // so `insertTimeRange` can't throw on the tail and lose the
                 // whole composition (and with it the 1080p path).
-                let audioDuration = try await aTrack.load(.timeRange).duration
+                let audioDuration: CMTime
+                if let declared = declaredDuration(of: audio) {
+                    audioDuration = declared
+                } else {
+                    audioDuration = try await aTrack.load(.timeRange).duration
+                }
                 let audioRange = CMTimeRange(start: .zero,
                                              duration: min(range.duration, audioDuration))
                 try aComp?.insertTimeRange(audioRange, of: aTrack, at: .zero)
@@ -428,10 +459,15 @@ enum TrailerResolver {
            Date().timeIntervalSince(cachedFailure.at) < backdropFailureTTL {
             return nil
         }
+        let extractStart = Date()
         guard let streams = await extractStreams(youtubeKey: youtubeKey) else {
+            PlayerProbe.event("trailer", String(format: "%@ extraction FAILED after %.1fs",
+                                                youtubeKey, Date().timeIntervalSince(extractStart)))
             rememberFailure(youtubeKey: youtubeKey, generation: generation)
             return nil
         }
+        PlayerProbe.event("trailer", String(format: "%@ extracted %d streams in %.1fs",
+                                            youtubeKey, streams.count, Date().timeIntervalSince(extractStart)))
         let playable = streams.filter { $0.isNativelyPlayable }
         let muxed = playable.filterVideoAndAudio().highestResolutionStream()
         let adaptive = playable.filterVideoOnly().highestResolutionStream()
@@ -482,9 +518,13 @@ enum TrailerResolver {
         guard let audio = choice.audio else {
             return budgeted(AVPlayerItem(asset: asset(for: choice.video)))
         }
+        let mergeStart = Date()
         if let merged = await mergedItem(video: choice.video, audio: audio) {
+            PlayerProbe.event("trailer", String(format: "merged %dp in %.1fs",
+                                                choice.height, Date().timeIntervalSince(mergeStart)))
             return merged
         }
+        PlayerProbe.event("trailer", String(format: "merge FAILED after %.1fs", Date().timeIntervalSince(mergeStart)))
         if let fallback = choice.muxedFallback {
             NSLog("[OrivioTrailer] backdrop merge failed — falling back to the muxed stream")
             return budgeted(AVPlayerItem(asset: asset(for: fallback)))
@@ -492,6 +532,214 @@ enum TrailerResolver {
         return budgeted(AVPlayerItem(asset: asset(for: choice.video)))
     }
 }
+
+/// Two DASH on-demand files (video-only + audio-only fragmented MP4, the way
+/// YouTube serves everything above 360p) presented to AVPlayer as one HLS
+/// stream.
+///
+/// Each file opens with its init header (`ftyp` + `moov`) and a `sidx` index
+/// giving every fragment's byte size and duration. That is exactly what an
+/// HLS media playlist with `EXT-X-MAP` + `EXT-X-BYTERANGE` describes, so the
+/// playlists are generated from the first 64 KB of each file and served from
+/// memory through a resource loader; the media itself is fetched by AVPlayer
+/// straight from googlevideo, fragment by fragment, starting at once.
+enum DashAsHLS {
+    fileprivate static let scheme = "orivio-dash"
+
+    /// nil whenever either file doesn't parse as expected — the caller then
+    /// takes the composition path, so nothing is lost by trying.
+    @MainActor
+    static func item(video: URL, audio: URL) async -> AVPlayerItem? {
+        async let videoHead = head(of: video)
+        async let audioHead = head(of: audio)
+        guard let v = await videoHead.flatMap(parse), let a = await audioHead.flatMap(parse) else {
+            return nil
+        }
+        let master = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"",
+            "#EXT-X-STREAM-INF:BANDWIDTH=\(v.bandwidth + a.bandwidth),AUDIO=\"a\"",
+            "video.m3u8",
+        ].joined(separator: "\n") + "\n"
+        let loader = PlaylistLoader(playlists: [
+            "master.m3u8": Data(master.utf8),
+            "video.m3u8": Data(playlist(for: video, v).utf8),
+            "audio.m3u8": Data(playlist(for: audio, a).utf8),
+        ])
+        guard let url = URL(string: "\(scheme)://\(UUID().uuidString)/master.m3u8") else { return nil }
+        let asset = AVURLAsset(url: url, options: [
+            "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": TrailerResolver.userAgent(for: video)]
+        ])
+        asset.resourceLoader.setDelegate(loader, queue: loader.queue)
+        // The resource loader does not keep its delegate alive; the asset does.
+        objc_setAssociatedObject(asset, &PlaylistLoader.associationKey, loader, .OBJC_ASSOCIATION_RETAIN)
+        return AVPlayerItem(asset: asset)
+    }
+
+    private struct Layout {
+        let initLength: Int
+        let segments: [(offset: Int, size: Int, seconds: Double)]
+        let bandwidth: Int
+    }
+
+    private static func head(of url: URL) async -> Data? {
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
+        request.setValue(TrailerResolver.userAgent(for: url), forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 206 else { return nil }
+        return data
+    }
+
+    /// Top-level boxes: the init header ends with `moov`; `sidx` lists the
+    /// fragments that follow it.
+    private static func parse(_ data: Data) -> Layout? {
+        let bytes = [UInt8](data)
+        func u32(_ i: Int) -> Int {
+            guard i >= 0, i + 4 <= bytes.count else { return -1 }
+            return Int(bytes[i]) << 24 | Int(bytes[i + 1]) << 16 | Int(bytes[i + 2]) << 8 | Int(bytes[i + 3])
+        }
+        func u64(_ i: Int) -> Int {
+            let high = u32(i), low = u32(i + 4)
+            return high < 0 || low < 0 ? -1 : high << 32 | low
+        }
+        var offset = 0
+        var moovEnd = -1
+        while offset + 8 <= bytes.count {
+            var size = u32(offset)
+            var header = 8
+            if size == 1 { size = u64(offset + 8); header = 16 }
+            guard size >= header else { return nil }
+            let type = String(bytes: bytes[(offset + 4) ..< (offset + 8)], encoding: .ascii) ?? ""
+            if type == "moov" { moovEnd = offset + size }
+            if type == "sidx" {
+                // Must be wholly inside what was fetched.
+                guard moovEnd > 0, offset + size <= bytes.count else { return nil }
+                var p = offset + header
+                let version = bytes[p]
+                p += 8                           // version/flags, reference_ID
+                let timescale = u32(p); p += 4
+                guard timescale > 0 else { return nil }
+                let firstOffset: Int
+                if version == 0 { firstOffset = u32(p + 4); p += 8 } else { firstOffset = u64(p + 8); p += 16 }
+                guard firstOffset >= 0, p + 4 <= offset + size else { return nil }
+                p += 2                           // reserved
+                let count = Int(bytes[p]) << 8 | Int(bytes[p + 1]); p += 2
+                guard p + count * 12 <= offset + size else { return nil }
+                var cursor = offset + size + firstOffset
+                var segments: [(offset: Int, size: Int, seconds: Double)] = []
+                var totalBytes = 0
+                var totalSeconds = 0.0
+                for _ in 0 ..< count {
+                    let reference = u32(p)
+                    let duration = u32(p + 4)
+                    p += 12
+                    // reference_type 1 is a nested index, not media — not used
+                    // by YouTube's on-demand files and not supported here.
+                    guard reference > 0, reference & 0x8000_0000 == 0, duration > 0 else { return nil }
+                    let length = reference & 0x7FFF_FFFF
+                    let seconds = Double(duration) / Double(timescale)
+                    segments.append((cursor, length, seconds))
+                    cursor += length
+                    totalBytes += length
+                    totalSeconds += seconds
+                }
+                guard !segments.isEmpty, totalSeconds > 0 else { return nil }
+                return Layout(initLength: moovEnd, segments: segments,
+                              bandwidth: max(Int(Double(totalBytes * 8) / totalSeconds * 1.5), 64_000))
+            }
+            offset += size
+        }
+        return nil
+    }
+
+    private static func playlist(for url: URL, _ layout: Layout) -> String {
+        let target = Int((layout.segments.map(\.seconds).max() ?? 10).rounded(.up))
+        var lines = [
+            "#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-PLAYLIST-TYPE:VOD",
+            "#EXT-X-TARGETDURATION:\(target)", "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            "#EXT-X-MAP:URI=\"\(url.absoluteString)\",BYTERANGE=\"\(layout.initLength)@0\"",
+        ]
+        for segment in layout.segments {
+            lines.append(String(format: "#EXTINF:%.5f,", segment.seconds))
+            lines.append("#EXT-X-BYTERANGE:\(segment.size)@\(segment.offset)")
+            lines.append(url.absoluteString)
+        }
+        lines.append("#EXT-X-ENDLIST")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Serves the three generated playlists; every media request is a normal
+    /// https fetch AVPlayer makes itself.
+    private final class PlaylistLoader: NSObject, AVAssetResourceLoaderDelegate {
+        nonisolated(unsafe) static var associationKey: UInt8 = 0
+        let queue = DispatchQueue(label: "orivio.dash-hls")
+        private let playlists: [String: Data]
+
+        init(playlists: [String: Data]) { self.playlists = playlists }
+
+        func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
+                            shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
+            guard let url = loadingRequest.request.url, url.scheme == DashAsHLS.scheme,
+                  let body = playlists[url.lastPathComponent] else { return false }
+            if let info = loadingRequest.contentInformationRequest {
+                info.contentType = "public.m3u-playlist"
+                info.contentLength = Int64(body.count)
+                info.isByteRangeAccessSupported = false
+            }
+            loadingRequest.dataRequest?.respond(with: body)
+            loadingRequest.finishLoading()
+            return true
+        }
+    }
+}
+
+#if DEBUG
+extension TrailerResolver {
+    /// Dev-only: `-trailerSelfTest <youtubeKey> [<key>…]` runs the real backdrop
+    /// path — extraction, stream choice, merge, AVPlayer — and logs how long
+    /// each step took and whether frames actually started, under
+    /// "OrivioTrailerTest". TMDB is not involved, so it needs no API key.
+    static func runSelfTestIfRequested() {
+        let args = ProcessInfo.processInfo.arguments
+        guard let flag = args.firstIndex(of: "-trailerSelfTest") else { return }
+        let keys = args[(flag + 1)...].prefix { !$0.hasPrefix("-") }
+        Task { @MainActor in
+            for key in keys {
+                let t0 = Date()
+                guard let item = await backdropItem(youtubeKey: key) else {
+                    NSLog("[OrivioTrailerTest] %@: NO ITEM after %.1fs", key, Date().timeIntervalSince(t0))
+                    continue
+                }
+                NSLog("[OrivioTrailerTest] %@: item after %.1fs", key, Date().timeIntervalSince(t0))
+                let player = AVPlayer(playerItem: item)
+                player.isMuted = true
+                player.play()
+                var verdict = "never played"
+                for _ in 0 ..< 40 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    if item.status == .failed {
+                        verdict = "FAILED: \(String(describing: item.error))"
+                        break
+                    }
+                    if player.timeControlStatus == .playing, player.currentTime().seconds > 1 {
+                        verdict = String(format: "PLAYING at %.1fs (size %.0fx%.0f)",
+                                         player.currentTime().seconds,
+                                         item.presentationSize.width, item.presentationSize.height)
+                        break
+                    }
+                }
+                NSLog("[OrivioTrailerTest] %@: %@ — %.1fs from start", key, verdict,
+                      Date().timeIntervalSince(t0))
+                player.pause()
+            }
+        }
+    }
+}
+#endif
 
 /// A bare `AVPlayerLayer` with no transport chrome — used to play a trailer
 /// silently behind the Detail hero. `.resizeAspectFill` so it fills the header

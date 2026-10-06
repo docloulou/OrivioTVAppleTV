@@ -707,6 +707,10 @@ final class AtmosHLSServer {
         guard let nwPort = NWEndpoint.Port(rawValue: 0) else { return false }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
+        // Loopback only, like the cache server: AVPlayer reaches it at
+        // 127.0.0.1, and nothing else on the network has any business pulling
+        // the viewer's audio stream off this box.
+        params.requiredInterfaceType = .loopback
         guard let listener = try? NWListener(using: params, on: nwPort) else { return false }
         listener.newConnectionHandler = { [weak self] connection in
             connection.start(queue: .main)

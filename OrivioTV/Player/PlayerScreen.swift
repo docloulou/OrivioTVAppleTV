@@ -139,6 +139,14 @@ struct PlayerScreen: View {
             RemoteMenuCatcher { if !viewModel.handleExit() { exitPlayer() } }
                 .allowsHitTesting(false)
                 .frame(width: 0, height: 0)
+            // ⏯ gets the same window-level net as Menu: a press landing while
+            // focus is between owners (every time the transport comes up) was
+            // otherwise delivered to nobody.
+            RemotePlayPauseCatcher {
+                if viewModel.playPausePressed(from: .window) { handlePlayPause() }
+            }
+                .allowsHitTesting(false)
+                .frame(width: 0, height: 0)
 
             // On-screen input diagnostics (Settings → Playback → toggle).
             if viewModel.settings.showInputDebug {
@@ -314,22 +322,7 @@ struct PlayerScreen: View {
         // The first frame appearing is a page-scale moment, not a control one.
         .animation(FusionMotion.pageEnter, value: viewModel.hasStartedPlayback)
         .onPlayPauseCommand {
-            if viewModel.isScrubbing {
-                viewModel.commitScrub()
-            // ⏯ MEANS PLAY/PAUSE, ALWAYS.
-            //
-            // It used to ALSO skip the intro while the pill was up over bare
-            // running video. That is the one control the viewer reaches for
-            // without looking, and it has to mean exactly one thing: pausing
-            // during an intro skipped it instead, so the press looked ignored
-            // and the pause only landed on the second press — "it sometimes
-            // takes 2 presses to pause". The Skip Intro pill is still a real
-            // focusable button (Select skips, and the gesture layer hands it
-            // focus on the first trackpad nudge), so the shortcut costs more
-            // than it saves.
-            } else {
-                viewModel.togglePlayPause()
-            }
+            if viewModel.playPausePressed(from: .command) { handlePlayPause() }
         }
         .onExitCommand {
             if !viewModel.handleExit() {
@@ -486,6 +479,27 @@ struct PlayerScreen: View {
         viewModel.scrubJump(60)
         try? await Task.sleep(nanoseconds: 2_000_000_000)
         viewModel.commitScrub()
+    }
+
+    /// One ⏯ press, from either delivery path (`onPlayPauseCommand` or the
+    /// window catcher).
+    private func handlePlayPause() {
+        if viewModel.isScrubbing {
+            viewModel.commitScrub()
+        // ⏯ MEANS PLAY/PAUSE, ALWAYS.
+        //
+        // It used to ALSO skip the intro while the pill was up over bare
+        // running video. That is the one control the viewer reaches for
+        // without looking, and it has to mean exactly one thing: pausing
+        // during an intro skipped it instead, so the press looked ignored
+        // and the pause only landed on the second press — "it sometimes
+        // takes 2 presses to pause". The Skip Intro pill is still a real
+        // focusable button (Select skips, and the gesture layer hands it
+        // focus on the first trackpad nudge), so the shortcut costs more
+        // than it saves.
+        } else {
+            viewModel.togglePlayPause()
+        }
     }
 
     /// Exit is immediate UNLESS a display-mode switch happened this session.

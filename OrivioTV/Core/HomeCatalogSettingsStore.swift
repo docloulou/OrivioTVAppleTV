@@ -203,6 +203,8 @@ struct HomePresentationSnapshot: Codable, Equatable {
     var fullStreamTitles = false
     var heroTrailersEnabled = true
     var heroTrailerSound = false
+    /// "5d" on Continue Watching cards of shows with an episode coming up.
+    var upcomingEpisodeCountdown = false
     /// Which catalog feeds the Home hero, as a `catalogKey`. Empty means
     /// AUTOMATIC — the first row in Home's order, which is what the hero has
     /// always used and stays the default, so nothing moves for anyone who
@@ -255,6 +257,7 @@ extension HomePresentationSnapshot {
         fullStreamTitles = (try? c.decode(Bool.self, forKey: .fullStreamTitles)) ?? d.fullStreamTitles
         heroTrailersEnabled = (try? c.decode(Bool.self, forKey: .heroTrailersEnabled)) ?? d.heroTrailersEnabled
         heroTrailerSound = (try? c.decode(Bool.self, forKey: .heroTrailerSound)) ?? d.heroTrailerSound
+        upcomingEpisodeCountdown = (try? c.decode(Bool.self, forKey: .upcomingEpisodeCountdown)) ?? d.upcomingEpisodeCountdown
         heroCatalogKey = (try? c.decode(String.self, forKey: .heroCatalogKey)) ?? d.heroCatalogKey
     }
 }
@@ -398,6 +401,11 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// Play that preview with sound instead of muted.
     @Published var heroTrailerSound: Bool = false {
         didSet { guard heroTrailerSound != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Countdown pill ("5d") on Continue Watching cards of shows whose next
+    /// episode hasn't aired yet. Off by default.
+    @Published var upcomingEpisodeCountdown: Bool = false {
+        didSet { guard upcomingEpisodeCountdown != oldValue else { return }; save(); notifyPresentationChange() }
     }
     /// Settings → Layout → Hero source: the `catalogKey` whose row feeds the
     /// hero. Empty = the first row in Home's order, which is what it always
@@ -786,6 +794,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         var fullStreamTitles: Bool?
         var heroTrailersEnabled: Bool?
         var heroTrailerSound: Bool?
+        var upcomingEpisodeCountdown: Bool?
         var heroCatalogKey: String?
     }
 
@@ -832,6 +841,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
             fullStreamTitles: fullStreamTitles,
             heroTrailersEnabled: heroTrailersEnabled,
             heroTrailerSound: heroTrailerSound,
+            upcomingEpisodeCountdown: upcomingEpisodeCountdown,
             heroCatalogKey: heroCatalogKey
         )
     }
@@ -871,6 +881,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         fullStreamTitles = d.fullStreamTitles
         heroTrailersEnabled = d.heroTrailersEnabled
         heroTrailerSound = d.heroTrailerSound
+        upcomingEpisodeCountdown = d.upcomingEpisodeCountdown
         heroCatalogKey = d.heroCatalogKey
     }
 
@@ -908,6 +919,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         fullStreamTitles = s.fullStreamTitles
         heroTrailersEnabled = s.heroTrailersEnabled
         heroTrailerSound = s.heroTrailerSound
+        upcomingEpisodeCountdown = s.upcomingEpisodeCountdown
         heroCatalogKey = s.heroCatalogKey
         suppressChange = false
         save()
@@ -975,6 +987,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         fullStreamTitles = decoded.fullStreamTitles ?? false
         heroTrailersEnabled = decoded.heroTrailersEnabled ?? true
         heroTrailerSound = decoded.heroTrailerSound ?? false
+        upcomingEpisodeCountdown = decoded.upcomingEpisodeCountdown ?? false
         heroCatalogKey = decoded.heroCatalogKey ?? ""
         suppressChange = false
     }
@@ -1022,6 +1035,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
             fullStreamTitles: fullStreamTitles,
             heroTrailersEnabled: heroTrailersEnabled,
             heroTrailerSound: heroTrailerSound,
+            upcomingEpisodeCountdown: upcomingEpisodeCountdown,
             heroCatalogKey: heroCatalogKey
         )
         guard let data = try? JSONEncoder().encode(persisted) else { return }

@@ -112,13 +112,25 @@ final class DetailViewModel: ObservableObject {
                 genres: meta.genres, cast: meta.cast, videos: meta.videos
             )
         }
+        // The id the enrichment services know this title by. An add-on "Up
+        // Next" row (`simkl_upnext_tt0903747_S3E7`) is the show under a
+        // per-episode alias that neither TMDB nor Trakt can resolve, so those
+        // pages came up with no cast, trailer or recommendations; and its show
+        // half can itself be a `tmdb:` id, which wants the same tt
+        // canonicalization the page id got above.
+        var enrichmentID = MetaItem.upNextShowID(from: meta.id) ?? meta.id
+        if enrichmentID.hasPrefix("tmdb:"), let n = Int(enrichmentID.dropFirst("tmdb:".count)),
+           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: !meta.isSeries) {
+            enrichmentID = tt
+        }
+        let enrichmentKey = enrichmentID
         // Kick off TMDB enrichment + Trakt comments in parallel with the meta fetch.
         // No key, no enrichment: TMDB now runs on the viewer's own key, and
         // without one every one of these requests is a guaranteed 401.
         let enrichTask = TMDBService.hasAPIKey
-            ? Task { await TMDBService.detail(imdbID: meta.id, type: meta.type) }
+            ? Task { await TMDBService.detail(imdbID: enrichmentKey, type: meta.type) }
             : nil
-        let commentsTask = Task { await TraktService.comments(imdbID: meta.id, type: meta.type) }
+        let commentsTask = Task { await TraktService.comments(imdbID: enrichmentKey, type: meta.type) }
         let ratingsTask = Task { await loadMDBRatings(settings: mdbSettings) }
 
         // Ask every meta add-on that could serve this id, not just the first.
@@ -150,7 +162,9 @@ final class DetailViewModel: ObservableObject {
         // against an id no other store or stream add-on knows, and resuming it
         // from Continue Watching found nothing. Same meta, the show's real id.
         if let showID = MetaItem.upNextShowID(from: meta.id) {
-            meta = meta.withID(showID)
+            // The canonical tt when the show half was a `tmdb:` id — the same
+            // identity every store and the Continue Watching resume use.
+            meta = meta.withID(showID.hasPrefix("tmdb:") ? enrichmentKey : showID)
         }
         // Still no episodes: TMDB knows the structure of essentially every
         // series, and an episode list from there is far better than a detail
@@ -1299,9 +1313,18 @@ struct DetailView: View {
                     LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
                         ForEach(viewModel.episodes(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
+                            // TMDB's still first when TMDB episode data is on
+                            // (the extras only load then), then the add-on's,
+                            // then the show's own art. Every link in the chain
+                            // is tried in turn: an unaired episode routinely
+                            // HAS a still URL that 404s, and stopping at the
+                            // first non-nil one left that card blank.
+                            let stills = [extra?.still, episode.thumbnail,
+                                          viewModel.meta.background, viewModel.meta.poster]
+                                .compactMap { $0 }.filter { !$0.isEmpty }
                             EpisodeCell(
-                                imageURL: episode.thumbnail ?? extra?.still
-                                    ?? viewModel.meta.background ?? viewModel.meta.poster,
+                                imageURL: stills.first,
+                                fallbackImageURLs: Array(stills.dropFirst()),
                                 title: episodeTitle(episode),
                                 airDateText: DateFormat.airDate(extra?.airDate ?? episode.released),
                                 subtitle: episodeSubtitle(episode, extra: extra),
@@ -1559,6 +1582,8 @@ private struct InertButtonStyle: ButtonStyle {
 /// inside the button instead bridged art and text into one lifting slab.
 private struct EpisodeCell: View {
     let imageURL: String?
+    /// Tried in order when `imageURL` won't load.
+    var fallbackImageURLs: [String] = []
     let title: String
     /// Original air date, "Jan 6, 2025" — its own line under the title.
     var airDateText: String?
@@ -1593,6 +1618,7 @@ private struct EpisodeCell: View {
                     watched: isWatched,
                     rating: rating,
                     width: Self.cardWidth,
+                    fallbackImageURLs: fallbackImageURLs,
                     subtitleBehavior: .readableOnFocus,
                     detailLine: detailLine,
                     remainingText: unreleasedText,

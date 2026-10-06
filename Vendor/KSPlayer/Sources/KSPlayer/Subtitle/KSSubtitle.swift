@@ -15,6 +15,10 @@ public class SubtitlePart: CustomStringConvertible, Identifiable {
     public var start: TimeInterval
     public var end: TimeInterval
     public var origin: CGPoint = .zero
+    /// Orivio: the bitmap cue's authoring canvas (PGS presentation size, DVD
+    /// "size:" line) — what `origin` and the image's pixel size are measured
+    /// against. `.zero` when the decoder never said.
+    public var canvasSize: CGSize = .zero
     public let text: NSAttributedString?
     public var image: UIImage?
     public var textPosition: TextPosition?

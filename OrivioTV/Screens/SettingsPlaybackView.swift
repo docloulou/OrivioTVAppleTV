@@ -389,6 +389,13 @@ struct PlaybackSettingsDetail: View {
                         subtitle: "When a forced track (foreign dialogue only) exists in your language, choose it",
                         isOn: s.subtitlePreferForced
                     )
+
+                    PlaybackToggleRow(
+                        icon: "puzzlepiece.extension.fill",
+                        title: "Prefer add-on subtitles",
+                        subtitle: "Choose a track from your subtitle add-ons (SubMaker, OpenSubtitles…) over the file's own track in the same language. Captions turn on a moment later while the add-ons answer.",
+                        isOn: s.preferAddonSubtitles
+                    )
                 }
 
                 Button { showSubtitleLanguages = true } label: {

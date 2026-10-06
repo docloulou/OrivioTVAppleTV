@@ -248,6 +248,12 @@ struct LayoutSettingsDetail: View {
                 )
 
                 SettingsToggleCard(
+                    title: "Upcoming episode countdown",
+                    subtitle: "Show a small badge like \"5d\" on Continue Watching cards when a show's next episode hasn't aired yet",
+                    isOn: $settings.upcomingEpisodeCountdown
+                )
+
+                SettingsToggleCard(
                     title: "Blur unwatched episodes",
                     subtitle: "Spoiler-blur episode thumbnails you haven't watched (focus a card to reveal it)",
                     isOn: $settings.blurUnwatchedEpisodes

@@ -458,6 +458,19 @@ struct MetaItem: Codable, Identifiable, Hashable {
         return copy
     }
 
+    /// The same card without its inline episode list. Some catalog add-ons
+    /// (the beamup TMDB add-on's series rows) inline EVERY episode of every
+    /// show in a catalog page — 12 MB a row, 96% of the Home cache, decoded at
+    /// every cold start and held in memory for posters that never read it.
+    /// Detail fetches the full meta when the card is opened.
+    func withoutVideos() -> MetaItem {
+        guard videos != nil else { return self }
+        return MetaItem(id: id, type: type, name: name, poster: poster, background: background,
+                        logo: logo, description: description, releaseInfo: releaseInfo,
+                        imdbRating: imdbRating, runtime: runtime, genres: genres, cast: cast,
+                        videos: nil, posterFallback: posterFallback)
+    }
+
     /// This title under another id, every other field carried over.
     func withID(_ newID: String) -> MetaItem {
         MetaItem(id: newID, type: type, name: name, poster: poster, background: background,
@@ -860,44 +873,6 @@ struct Stream: Codable, Hashable {
     }
 
     var isTorrent: Bool { infoHash != nil && url == nil }
-
-    /// Addons whose origin has refused a byte-range request outright.
-    ///
-    /// Keyed by ADDON, not by link, for the same reason `noticeClipsByAddon`
-    /// is: an addon that hands out cast endpoints hands out cast endpoints for
-    /// everything, so its next link refuses ranges too. Seen on "DMM Cast for
-    /// TorBox", which answers 500 to every range request — the proxy fails open
-    /// so the film PLAYS, and caching, seeking and scrub previews are all
-    /// silently impossible for the rest of the session. Nothing about that is
-    /// visible to the viewer beyond "the cache isn't working".
-    ///
-    /// Persisted, because the verdict is about the addon and not about tonight.
-    /// Auto-selection only: a manual tap still plays whatever you choose.
-    enum RangeRefusingAddons {
-        // v2: the first version noted an addon after ONE failure on any status,
-        // including 416 — which meant a good source could be excluded for good
-        // on the strength of a bad request we made ourselves. Anything the
-        // eager version recorded is untrustworthy, so the key moves and the old
-        // list is simply abandoned.
-        private static let key = "cache.addonsRefusingRanges.v2"
-
-        static var all: Set<String> {
-            Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
-        }
-
-        static func note(_ addon: String?) {
-            guard let addon, !addon.isEmpty else { return }
-            var current = all
-            guard current.insert(addon).inserted else { return }
-            UserDefaults.standard.set(Array(current), forKey: key)
-            NSLog("[OrivioCache] %@ refuses byte ranges — excluded from auto-selection", addon)
-        }
-
-        static func contains(_ addon: String?) -> Bool {
-            guard let addon, !addon.isEmpty else { return false }
-            return all.contains(addon)
-        }
-    }
 
     /// A cast / open-externally stream (e.g. DMM Cast): no in-app-playable url
     /// and no torrent, but a link to hand off to the system / an external app.

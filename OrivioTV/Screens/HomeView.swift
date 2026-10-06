@@ -55,6 +55,10 @@ enum HomeCatalogCache {
     static func load() -> [String: [MetaItem]] {
         guard let data = try? Data(contentsOf: fileURL),
               let decoded = try? JSONDecoder().decode([String: [MetaItem]].self, from: data) else { return [:] }
+        // Rows are saved already slimmed where that is safe (see the catalog
+        // fetch), so nothing is stripped here: the cache has no record of which
+        // add-on a row came from, and stripping blind would drop the episode
+        // lists a catalog-only add-on is the sole source of.
         return decoded
     }
 
@@ -548,7 +552,16 @@ final class HomeViewModel: ObservableObject {
                         // does: a repeated MetaItem.id inside a tvOS ForEach
                         // crashes the focus engine, and aggregator catalogs do
                         // return the same title twice.
-                        items: Array(items.deduplicatedByID().prefix(30)),
+                        // Episode lists are shed only when this add-on can
+                        // hand them back: Detail re-fetches the full meta from
+                        // the meta add-ons, and a catalog-only add-on whose
+                        // rows inline their episodes is the ONLY source of
+                        // them — stripped, those titles opened with no
+                        // episodes when no TMDB key was set to fall back on.
+                        items: Array(items.deduplicatedByID().prefix(30)).map { item in
+                            request.addon.manifest.providesMeta && request.addon.handles(id: item.id)
+                                ? item.withoutVideos() : item
+                        },
                         addon: request.addon,
                         catalog: request.catalog
                     )
@@ -1276,6 +1289,10 @@ struct HomeView: View {
     /// show and are still unwatched. Drives the green "+N" badge. Covers shows
     /// with a real progress row too, not just the synthesised Next Up cards.
     @State private var newEpisodeCounts: [String: Int] = [:]
+    /// metaID → when the show's next not-yet-aired episode airs, for the
+    /// "5d" countdown (Settings → Layout → Upcoming episode countdown).
+    /// Derived from the same episode lists as `newEpisodeCounts`.
+    @State private var upcomingAirDates: [String: Date] = [:]
 
     /// Drives the Apple TV hero's spotlight rotation. Ticks every 2s; the hero
     /// only advances when it's been idle for a few seconds (see rotateIfIdle).
@@ -1283,7 +1300,11 @@ struct HomeView: View {
     /// run-loop tracking mode that focus/scroll animations run in, waking
     /// SwiftUI mid-scroll every 2s on the A8 for a check whose real pacing is
     /// the idle-dwell gate (see the HeroTrailerLayer watchdog note).
-    private let spotlightTick = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
+    /// STATIC — one timer for the process. Held as an instance `let`, a new
+    /// autoconnected timer was built every time the parent re-created this
+    /// view, and `onReceive` re-subscribed to it: each parent redraw restarted
+    /// the countdown, so frequent redraws could hold the tick off entirely.
+    private static let spotlightTick = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
 
     /// False while Home is covered (player fullScreenCover, pushed screen,
     /// other tab). Home stays mounted in those states, so without this gate the
@@ -1363,7 +1384,7 @@ struct HomeView: View {
             AppProbe.focus("home hero UNPIN via strip (focused & pinned)")
             hero.resetBrowseHandoff()
         }
-        .onReceive(spotlightTick) { _ in
+        .onReceive(Self.spotlightTick) { _ in
             // §55: Reduce Motion disables automatic hero rotation in every
             // mode. `hero.rolls` is the Hero Layout gate: Pinned Focus never
             // rotates (a timer swapping the highlighted title out from under
@@ -1925,6 +1946,11 @@ struct HomeView: View {
             items: items,
             hero: hero,
             imageFor: continueImage,
+            fallbackImagesFor: continueFallbackImages,
+            upcomingFor: { [enabled = homeCatalogSettings.upcomingEpisodeCountdown, dates = upcomingAirDates] progress in
+                guard enabled, let date = dates[progress.metaID] else { return nil }
+                return Self.countdownText(to: date)
+            },
             subtitleFor: continueSubtitle,
             blurFor: { [blur = homeCatalogSettings.blurContinueWatchingNextUp] progress in
                 blur && progress.fraction < 0.02
@@ -2133,9 +2159,11 @@ struct HomeView: View {
         let showUnaired = homeCatalogSettings.showUnairedNextUp
         let fromFurthest = homeCatalogSettings.nextUpFromFurthestEpisode
         let entries = fetched.compactMap { $0 }
-        let (rows, counts) = await Task.detached(priority: .userInitiated) {
+        let (rows, counts, upcoming) = await Task.detached(priority: .userInitiated) {
             var rows: [WatchProgress] = []
             var counts: [String: Int] = [:]
+            var upcoming: [String: Date] = [:]
+            let now = Date()
             for entry in entries {
                 // Keyed by the CANONICAL id the watch/progress stores use, not
                 // the id the meta addon echoed back — a fallback meta addon can
@@ -2147,6 +2175,13 @@ struct HomeView: View {
                                                  startedAt: startedAt[contentID],
                                                  reached: reached[contentID] ?? [])
                 if count > 0 { counts[contentID] = count }
+                if let next = entry.meta.playbackSeasons
+                    .flatMap({ entry.meta.episodesIncludingLinkedSpecials(season: $0) })
+                    .compactMap(\.airedDate)
+                    .filter({ $0 > now })
+                    .min() {
+                    upcoming[contentID] = next
+                }
                 guard entry.target.wantsCard,
                       let next = Self.nextUpEpisode(in: entry.meta, contentID: contentID,
                                                     watchedKeys: watchedKeys,
@@ -2156,11 +2191,12 @@ struct HomeView: View {
                                                 lastWatchedAt: entry.target.lastWatchedAt,
                                                 newEpisodeCount: count))
             }
-            return (rows, counts)
+            return (rows, counts, upcoming)
         }.value
         if !Task.isCancelled {
             nextUpContinueItems = rows
             newEpisodeCounts = counts
+            upcomingAirDates = upcoming
         }
     }
 
@@ -2417,6 +2453,22 @@ struct HomeView: View {
         return progress.background ?? progress.poster ?? catalogMeta(for: progress.metaID)?.background ?? catalogMeta(for: progress.metaID)?.poster
     }
 
+    /// The show's own art behind an episode still. An unaired episode's still
+    /// URL usually exists and 404s, which used to leave that card blank.
+    private func continueFallbackImages(_ progress: WatchProgress) -> [String] {
+        [progress.background, progress.poster,
+         catalogMeta(for: progress.metaID)?.background, catalogMeta(for: progress.metaID)?.poster]
+            .compactMap { $0 }
+    }
+
+    /// "Today", "1d", "5d" — the countdown pill's text.
+    static func countdownText(to date: Date) -> String {
+        let calendar = Calendar.current
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: Date()),
+                                           to: calendar.startOfDay(for: date)).day ?? 0
+        return days <= 0 ? "Today" : "\(days)d"
+    }
+
     /// A hero-bar item for a Continue Watching entry. Progress rows only carry
     /// name/art, so prefer the full MetaItem when the title is also in a
     /// loaded catalog row (description, genres, rating…).
@@ -2658,6 +2710,8 @@ private struct ContinueWatchingRow: View {
     /// renders from it.
     let hero: HeroFocus
     let imageFor: (WatchProgress) -> String?
+    let fallbackImagesFor: (WatchProgress) -> [String]
+    let upcomingFor: (WatchProgress) -> String?
     let subtitleFor: (WatchProgress) -> String?
     let blurFor: (WatchProgress) -> Bool
     let heroItemFor: (WatchProgress) -> MetaItem
@@ -2716,6 +2770,8 @@ private struct ContinueWatchingRow: View {
                       ContinueWatchingCell(
                         progress: progress,
                         imageURL: imageFor(progress),
+                        fallbackImages: fallbackImagesFor(progress),
+                        upcomingText: upcomingFor(progress),
                         subtitle: subtitleFor(progress),
                         blur: blurFor(progress),
                         hero: hero,
@@ -2781,6 +2837,8 @@ private struct ContinueWatchingCell: View, Equatable {
     @EnvironmentObject private var theme: ThemeManager
     let progress: WatchProgress
     let imageURL: String?
+    let fallbackImages: [String]
+    let upcomingText: String?
     let subtitle: String?
     let blur: Bool
     let hero: HeroFocus
@@ -2794,6 +2852,8 @@ private struct ContinueWatchingCell: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.progress == rhs.progress
             && lhs.imageURL == rhs.imageURL
+            && lhs.fallbackImages == rhs.fallbackImages
+            && lhs.upcomingText == rhs.upcomingText
             && lhs.subtitle == rhs.subtitle
             && lhs.blur == rhs.blur
     }
@@ -2809,6 +2869,8 @@ private struct ContinueWatchingCell: View, Equatable {
                     title: progress.name,
                     subtitle: subtitle,
                     progress: progress.fraction,
+                    fallbackImageURLs: fallbackImages,
+                    upcomingText: upcomingText,
                     remainingText: progress.remainingTimeText,
                     newEpisodeCount: progress.newEpisodeCount ?? 0,
                     blurImage: blur,
@@ -3104,7 +3166,14 @@ private struct HeroTrailerLayer: View {
     /// been looking at a still for so long that a preview snapping in reads
     /// as a glitch rather than a flourish — and the extraction is very likely
     /// wedged behind a slow remote fallback.
-    private static let resolveTimeout: TimeInterval = 12
+    ///
+    /// Twenty, not twelve. Measured 2026-10-02: once YouTube stops answering
+    /// the local extractor (a bot-check page — routine for any address that
+    /// has extracted a lot, VPN or not) the REMOTE extractor alone takes 8-9s,
+    /// and twelve left almost no room for anything else, so the trailer was
+    /// thrown away just as it became ready. A viewer resting on a title for
+    /// fifteen seconds still wants its preview.
+    private static let resolveTimeout: TimeInterval = 20
 
     private func run() async {
         teardown()
@@ -3463,7 +3532,8 @@ private struct ATVHeroInfoView: View {
 
     @ViewBuilder
     private func content(_ item: MetaItem) -> some View {
-        if item.type == "collection" {
+        let isCollection = item.type == "collection"
+        if isCollection {
             // The category's NAME — deliberately not its cover tile, which
             // reads as a stray poster floating on the billboard. Raised by the
             // height of the meta line / synopsis / button block a real title
@@ -3474,7 +3544,9 @@ private struct ATVHeroInfoView: View {
                 .foregroundStyle(theme.palette.textPrimary)
                 .lineLimit(2)
                 .shadow(color: .black.opacity(scheme == .light ? 0 : 0.4), radius: 10, y: 4)
-                .padding(.bottom, 180)
+                // Less the stack spacing the (collapsed) actions block below
+                // still takes, so the name sits exactly where it always did.
+                .padding(.bottom, 180 - OrivioSpacing.md)
         } else {
             // (The "TOP 10" eyebrow now lives at the hero's top-left corner —
             // see FusionHeroHeader.)
@@ -3502,13 +3574,25 @@ private struct ATVHeroInfoView: View {
                     .lineLimit(2)
                     .frame(maxWidth: 820, alignment: .leading)
             }
+        }
 
             // Left/Right on the Play button browse the spotlight titles via
             // two invisible focusable sentinels flanking it — each bounces
             // focus straight back after stepping. NOT `.onMoveCommand`: that
             // swallows EVERY direction on the focused view, so Down could
             // never leave the hero and the catalog rows were unreachable.
+            //
+            // MOUNTED FOR COLLECTIONS TOO — collapsed, invisible and disabled
+            // instead of absent. The hero follows the card under focus, and a
+            // collection folder's billboard used to drop this whole block: the
+            // Play button and both focusable sentinels left the tree, then came
+            // back on the next real title. Focusable views appearing and
+            // vanishing while the viewer scrolls makes the focus engine
+            // re-resolve, which is exactly what strands the native card lift on
+            // the card they already left while the caption follows the new one
+            // (the same mechanism as the trailer-layer and folder-GIF fixes).
             if showsActions {
+            Group {
             HStack(spacing: 0) {
                 // Dropped while the rail is hidden, so LEFT finds no candidate
                 // here, bubbles up to RootView's `onMoveCommand`, and brings
@@ -3590,7 +3674,11 @@ private struct ATVHeroInfoView: View {
                     .padding(.top, OrivioSpacing.sm)
             }
             }
-        }
+            .opacity(isCollection ? 0 : 1)
+            .frame(height: isCollection ? 0 : nil, alignment: .top)
+            .disabled(isCollection)
+            .accessibilityHidden(isCollection)
+            }
     }
 
     @ViewBuilder

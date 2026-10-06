@@ -348,7 +348,14 @@ enum TMDBService {
             return value
         } catch {
             done("FAILED")
-            AppProbe.warn("tmdb", "\(path) — \(error)")
+            // Never the error's own description: a URLSession error carries the
+            // failing URL in its userInfo, and the query holds the API key —
+            // which then sat in plain text in the probe ring.
+            let nsError = error as NSError
+            let reason = error is TMDBError
+                ? error.localizedDescription
+                : "\(nsError.domain) \(nsError.code)"
+            AppProbe.warn("tmdb", "\(path) — \(reason)")
             throw error
         }
     }
@@ -1158,7 +1165,10 @@ enum TMDBService {
             ? "credits,recommendations,similar,videos,release_dates"
             : "credits,recommendations,similar,videos,content_ratings"
         guard let body: DetailResponse = try? await get(
-            path, query: ["language": language, "append_to_response": appended]
+            path, query: ["language": language, "append_to_response": appended,
+                          // See `trailerKeys`: the appended videos follow the
+                          // request language unless told otherwise.
+                          "include_video_language": Self.videoLanguages(language)]
         ) else { return nil }
 
         func movieCertification(_ dates: DetailResponse.ReleaseDates?) -> String? {
@@ -1401,6 +1411,13 @@ enum TMDBService {
     /// exit in another country, since YouTube restricts trailers by region
     /// like any other upload. TMDB usually lists several, and the ones behind
     /// the first are often not restricted at all.
+    /// The viewer's language, then English, then untagged — TMDB's
+    /// `include_video_language` list for trailers.
+    private static func videoLanguages(_ language: String) -> String {
+        let primary = language.split(separator: "-").first.map(String.init) ?? language
+        return primary == "en" ? "en,null" : "\(primary),en,null"
+    }
+
     static func trailerKeys(id: String, type: String) async -> [String] {
         let cacheKey = "\(type):\(id)"
         if let hit = cachedTrailerKeys(cacheKey) { return hit }
@@ -1422,7 +1439,12 @@ enum TMDBService {
             let results: [Video]?
         }
         let path = isMovie ? "/movie/\(tmdbID)/videos" : "/tv/\(tmdbID)/videos"
-        let body: VideosResponse? = try? await get(path)
+        // Without `include_video_language` TMDB returns only videos tagged
+        // with the request language — so a viewer with a non-English language
+        // set got NO trailers for most titles, whose trailers are tagged "en".
+        let body: VideosResponse? = try? await get(path, query: [
+            "include_video_language": Self.videoLanguages(preferredLanguage)
+        ])
         let ranked = (body?.results ?? [])
             .filter {
                 ($0.site?.caseInsensitiveCompare("YouTube") == .orderedSame)

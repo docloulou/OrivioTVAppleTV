@@ -1,4 +1,5 @@
 import Foundation
+import TVServices
 
 /// Writes the Continue Watching list into the shared app-group container so
 /// the Top Shelf extension can render it on the tvOS home screen. Called from
@@ -96,6 +97,10 @@ enum TopShelfExporter {
         // sitting on the home screen, which is the leak being closed.
         let payload = activeProfileIsLocked ? [] : entries
         guard let data = try? JSONEncoder().encode(payload) else { return }
+        // Unchanged since the last write: nothing for the shelf to reload.
+        // Progress saves run throughout playback and sync, and each one would
+        // otherwise ask the system to rebuild the home screen's shelf.
+        let changed = (try? Data(contentsOf: file)) != data
         // Reported, not swallowed: a `try?` here is what let the unwritable
         // container root go unnoticed for as long as it did.
         do {
@@ -103,6 +108,7 @@ enum TopShelfExporter {
         } catch {
             NSLog("[TopShelf] snapshot write failed at %@: %@",
                   file.path, String(describing: error))
+            return
         }
         // The scheme the extension must deep-link on, published by the ONE
         // side that knows it for certain: `orivio` is claimed by every other
@@ -113,6 +119,14 @@ enum TopShelfExporter {
         // next to the snapshot.
         if let schemeFile = AppGroupResolver.sharedFile("topshelf-scheme.txt") {
             try? Data(AppCallbackScheme.value.utf8).write(to: schemeFile, options: .atomic)
+        }
+        // TELL THE SYSTEM — last, once both files the extension reads are in
+        // place. tvOS calls the extension's `loadTopShelfContent` only when it
+        // decides to, and without this it had no reason to: the home screen
+        // kept showing whatever Continue Watching looked like the last time it
+        // happened to ask.
+        if changed {
+            TVTopShelfContentProvider.topShelfContentDidChange()
         }
     }
 }

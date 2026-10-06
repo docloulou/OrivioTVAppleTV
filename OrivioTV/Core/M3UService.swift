@@ -59,19 +59,24 @@ enum M3UService {
         if let hit { return hit }
 
         guard let url = URL(string: urlString) else { return [] }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        // A captive portal (or any error page) answers 200 with HTML. Without
-        // a status check that parsed to zero channels and was CACHED for the
-        // process lifetime, so Live TV stayed empty until the app was killed
-        // even after the network came good.
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            NSLog("[OrivioM3U] %@ returned HTTP %d — not caching", urlString, http.statusCode)
-            return []
+        let parsed: [M3UChannel]
+        if let xtream = await xtreamLiveChannels(playlistURL: url), !xtream.isEmpty {
+            parsed = xtream
+        } else {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 30
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let text = String(data: data, encoding: .utf8) else { return [] }
+            // A captive portal (or any error page) answers 200 with HTML. Without
+            // a status check that parsed to zero channels and was CACHED for the
+            // process lifetime, so Live TV stayed empty until the app was killed
+            // even after the network came good.
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                NSLog("[OrivioM3U] %@ returned HTTP %d — not caching", urlString, http.statusCode)
+                return []
+            }
+            parsed = await Task.detached(priority: .userInitiated) { parse(text) }.value
         }
-        let parsed = await Task.detached(priority: .userInitiated) { parse(text) }.value
         // Only cache a real playlist. An empty parse is either an error page
         // or a truncated download; caching it makes the failure permanent.
         guard !parsed.isEmpty else { return [] }
@@ -224,5 +229,113 @@ enum M3UService {
             }
         }
         return ""
+    }
+}
+
+// MARK: - Xtream Codes API
+
+extension M3UService {
+    /// Live channels for an IPTV provider login, read through the Xtream
+    /// Codes JSON API (`player_api.php`) — the endpoint every other IPTV app
+    /// signs in with. The login is stored as the provider's `get.php`
+    /// playlist URL, but many providers switch that M3U download off, or it
+    /// runs past the timeout because it bundles the whole VOD library, so a
+    /// login that works everywhere else came back with no channels here.
+    /// nil when the URL isn't a provider login or the API doesn't answer
+    /// with an authorised account; the caller then falls back to `get.php`.
+    fileprivate static func xtreamLiveChannels(playlistURL url: URL) async -> [M3UChannel]? {
+        guard url.path.lowercased().hasSuffix("/get.php"),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems,
+              let username = items.first(where: { $0.name == "username" })?.value, !username.isEmpty,
+              let password = items.first(where: { $0.name == "password" })?.value, !password.isEmpty
+        else { return nil }
+        let apiPath = String(components.path.dropLast("get.php".count)) + "player_api.php"
+        components.path = apiPath
+        let serverBase = String(url.absoluteString.prefix(while: { $0 != "?" }).dropLast("get.php".count))
+
+        func call(_ action: String?) async -> Any? {
+            var c = components
+            c.queryItems = [URLQueryItem(name: "username", value: username),
+                            URLQueryItem(name: "password", value: password)]
+                + (action.map { [URLQueryItem(name: "action", value: $0)] } ?? [])
+            // Same `+` rule as LiveTVSettingsStore.providerPlaylistURL.
+            c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+            guard let callURL = c.url else { return nil }
+            var request = URLRequest(url: callURL)
+            request.timeoutInterval = 30
+            guard let (data, response) = try? await URLSession.shared.data(for: request) else { return nil }
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                NSLog("[OrivioM3U] Xtream %@ returned HTTP %d", action ?? "login", http.statusCode)
+                return nil
+            }
+            return await Task.detached(priority: .userInitiated) {
+                try? JSONSerialization.jsonObject(with: data)
+            }.value
+        }
+
+        // Panels send numbers and strings interchangeably for the same field.
+        func text(_ value: Any?) -> String? {
+            switch value {
+            case let s as String: return s
+            case let n as NSNumber: return n.stringValue
+            default: return nil
+            }
+        }
+
+        guard let login = await call(nil) as? [String: Any],
+              let user = login["user_info"] as? [String: Any],
+              text(user["auth"]) == "1" else {
+            NSLog("[OrivioM3U] Xtream login not authorised — trying get.php")
+            return nil
+        }
+        // HLS when the account allows it (what `get.php` asked for), else the
+        // raw TS every panel serves.
+        let formats = (user["allowed_output_formats"] as? [Any])?.compactMap { text($0) } ?? []
+        let ext = formats.isEmpty || formats.contains("m3u8") ? "m3u8" : "ts"
+
+        let categories = await call("get_live_categories") as? [[String: Any]] ?? []
+        guard let streams = await call("get_live_streams") as? [[String: Any]] else { return nil }
+
+        var categoryName: [String: String] = [:]
+        var categoryRank: [String: Int] = [:]
+        for (i, category) in categories.enumerated() {
+            guard let id = text(category["category_id"]) else { continue }
+            categoryName[id] = text(category["category_name"])
+            categoryRank[id] = i
+        }
+        let pathAllowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
+        let user_ = username.addingPercentEncoding(withAllowedCharacters: pathAllowed) ?? username
+        let pass_ = password.addingPercentEncoding(withAllowedCharacters: pathAllowed) ?? password
+
+        return await Task.detached(priority: .userInitiated) { () -> [M3UChannel] in
+            // Panel order: categories as the provider lists them, channels by
+            // their number within each — what the `get.php` playlist gives.
+            let ordered = streams.enumerated().sorted { a, b in
+                let ra = text(a.element["category_id"]).flatMap { categoryRank[$0] } ?? Int.max
+                let rb = text(b.element["category_id"]).flatMap { categoryRank[$0] } ?? Int.max
+                if ra != rb { return ra < rb }
+                let na = Int(text(a.element["num"]) ?? "") ?? Int.max
+                let nb = Int(text(b.element["num"]) ?? "") ?? Int.max
+                return na != nb ? na < nb : a.offset < b.offset
+            }
+            var channels: [M3UChannel] = []
+            var seen = Set<String>()
+            for (_, stream) in ordered {
+                guard let streamID = text(stream["stream_id"]), !streamID.isEmpty,
+                      let name = text(stream["name"])?.trimmingCharacters(in: .whitespaces), !name.isEmpty
+                else { continue }
+                let streamURL = "\(serverBase)live/\(user_)/\(pass_)/\(streamID).\(ext)"
+                guard seen.insert(streamURL).inserted else { continue }
+                let logo = text(stream["stream_icon"]).flatMap { $0.isEmpty ? nil : $0 }
+                let group = text(stream["category_id"]).flatMap { categoryName[$0] }
+                channels.append(M3UChannel(
+                    id: streamURL, name: name, url: streamURL, logo: logo,
+                    group: group?.isEmpty == false ? group! : "Other",
+                    country: country(fromTvgID: text(stream["epg_channel_id"]))
+                ))
+            }
+            return channels
+        }.value
     }
 }

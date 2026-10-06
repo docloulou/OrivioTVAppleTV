@@ -2335,9 +2335,10 @@ final class PlayerViewModel: ObservableObject {
                         DVEmbeddedSubtitleInfo(streamIndex: $0.index, label: "\($0.label) · Embedded")
                     }
                     self.dvEmbeddedSubs.forEach { self.subtitleModel.addSubtitle(info: $0) }
-                    engine.onSubtitleEvent = { [weak self] start, end, text, image in
+                    engine.onSubtitleEvent = { [weak self] start, end, text, image, origin, canvas in
                         guard let self, let active = self.dvActiveEmbeddedSub else { return }
                         active.add(start: start, end: end, text: text, image: image,
+                                   origin: origin, canvas: canvas,
                                    playhead: self.position)
                     }
                     self.fetchAddonSubtitles()
@@ -4063,26 +4064,24 @@ final class PlayerViewModel: ObservableObject {
            let proxied = MediaCacheServer.shared.beginSession(
                origin: originURL,
                headers: entry.stream.behaviorHints?.proxyHeaders?.requestHeaders) {
-            // Remember an origin that refuses ranges, so the picker stops
-            // choosing this addon. Captured per load; the closure is replaced
-            // on the next one.
+            // An origin that refuses ranges: move THIS film to another
+            // source. Nothing is remembered about the addon — the persistent
+            // "refuses ranges" blacklist was removed after it wrote off Comet
+            // for an expired debrid link. Captured per load; the closure is
+            // replaced on the next one.
             let addon = currentEntry.addonName
             MediaCacheServer.shared.onOriginRefusedRanges = { [weak self] note in
-                Stream.RangeRefusingAddons.note(addon)
-                Self.colorTrail("cache: \(addon) \(note) — excluded from auto-selection")
+                Self.colorTrail("cache: \(addon) \(note)")
                 // A PROBE EVENT, not just a trail line. The throttle back-off
                 // taught this the hard way: a recorder watching the probe read
                 // "0 throttle events" while throttling ran continuously
                 // underneath it, because that path only wrote to the trail.
-                PlayerProbe.event("cache", "\(addon) \(note)"
-                    + " — excluded from auto-selection, moving to another source")
+                PlayerProbe.event("cache", "\(addon) \(note) — moving to another source")
                 self?.decisionLog.record("Cache", "Source refuses ranges",
                                          because: "\(addon) \(note); caching and seeking are impossible")
-                // AND LEAVE IT. Remembering the addon only helps the NEXT
-                // title; it does nothing for the viewer sitting in front of
-                // this one, who has a film that cannot cache, cannot seek and
-                // cannot show a scrub preview, with nothing on screen to say
-                // why. Three sessions ended up here tonight on the same cast
+                // AND LEAVE IT. The viewer sitting in front of this one has a
+                // film that cannot cache, cannot seek and cannot show a scrub
+                // preview, with nothing on screen to say why. Three sessions ended up here tonight on the same cast
                 // endpoint. Every retry has been spent by this point — the
                 // cache does not call this until all of them have failed on an
                 // HTTP status — so there is nothing left to wait for.
@@ -4839,6 +4838,7 @@ final class PlayerViewModel: ObservableObject {
         fineCenter = nil
         cacheTask?.cancel()
         addonSubtitlesFetched = false
+        addonSubtitleWaveLanded = false
         subtitleAutoApplied = false
         pendingEndAfterSwitch = false   // a new stream: the old end is moot
         // A reload's re-select target belongs to the load that asked for it —
@@ -5378,13 +5378,31 @@ final class PlayerViewModel: ObservableObject {
               !subtitleAutoApplied else { return }
         let real = subtitleOptions.filter { $0.id != "sub-off" }
         guard !real.isEmpty else { return }
+        // "Prefer add-on subtitles": the embedded wave lands first, and picking
+        // from it latches the session before SubMaker & co. have answered — so
+        // their tracks were never even considered. Hold the pick until the
+        // addon wave is in (it always ends in an `allowFallback` call).
+        if settings.preferAddonSubtitles, !allowFallback, !addonSubtitleWaveLanded,
+           !addonManager.subtitleAddons.isEmpty {
+            return
+        }
 
         // Preferred language, then the secondary fallback, then (once no more
         // waves are coming) the first available. Within a language, honor the
         // "prefer forced" setting.
         func pickInLanguage(_ code: String) -> TrackOption? {
-            let matches = real.filter { optionMatchesLanguage($0, code) }
+            var matches = real.filter { optionMatchesLanguage($0, code) }
             guard !matches.isEmpty else { return nil }
+            // Language still outranks source: an addon track only jumps ahead
+            // of the file's own tracks in the SAME language. Addon tracks are
+            // the `URLSubtitleInfo`s (the rule `reloadSubtitles` uses too).
+            if settings.preferAddonSubtitles {
+                func isAddon(_ option: TrackOption) -> Bool {
+                    if case .subtitle(let info) = option.payload { return info is URLSubtitleInfo }
+                    return false
+                }
+                matches = matches.filter(isAddon) + matches.filter { !isAddon($0) }
+            }
             if settings.subtitlePreferForced,
                let forced = matches.first(where: { $0.displayName.localizedCaseInsensitiveContains("forced") }) {
                 return forced
@@ -5434,6 +5452,9 @@ final class PlayerViewModel: ObservableObject {
     /// Pull external subtitles from any installed subtitle addon (e.g.
     /// OpenSubtitles) and add them to the picker alongside embedded tracks.
     private var addonSubtitlesFetched = false
+    /// The addon wave for this load has come back (with or without tracks).
+    /// Lets a "prefer add-on subtitles" pick stop waiting for it.
+    private var addonSubtitleWaveLanded = false
     private func fetchAddonSubtitles() {
         guard !addonSubtitlesFetched else { return }
         let providers = addonManager.subtitleAddons
@@ -5512,6 +5533,7 @@ final class PlayerViewModel: ObservableObject {
                     added = true
                 }
             }
+            self.addonSubtitleWaveLanded = true
             guard added else {
                 self.pendingSubtitleReselect = nil
                 // No addon subs arrived — this was the last wave, so let a
@@ -5984,6 +6006,32 @@ final class PlayerViewModel: ObservableObject {
             : Float(UIScreen.main.maximumFramesPerSecond)
         return AVDisplayCriteria(refreshRate: rate, videoDynamicRange: r.rawValue)
     }
+
+    enum PlayPauseSource { case command, window }
+    private var lastPlayPauseDelivery: (source: PlayPauseSource, at: Date, paired: Bool)?
+
+    /// One physical ⏯ press can arrive TWICE — through `onPlayPauseCommand`
+    /// when focus is inside the player, and through the window catcher always.
+    /// Returns false for the second delivery of a press already handled.
+    ///
+    /// Paired by SOURCE, not by time alone: a delivery is a duplicate only when
+    /// it comes from the OTHER path, inside the pairing window, and the earlier
+    /// delivery has not already been paired. A deliberate quick double press
+    /// produces two deliveries per path, so it still counts as two presses —
+    /// which matters, because three in two seconds is the display re-sync.
+    /// Measured in the simulator with XCUIRemote: the command lands first and
+    /// the window delivery 4-17ms after it, held presses included.
+    func playPausePressed(from source: PlayPauseSource) -> Bool {
+        let now = Date()
+        if let last = lastPlayPauseDelivery, last.source != source, !last.paired,
+           now.timeIntervalSince(last.at) < Self.playPausePairingWindow {
+            lastPlayPauseDelivery?.paired = true
+            return false
+        }
+        lastPlayPauseDelivery = (source, now, false)
+        return true
+    }
+    private static let playPausePairingWindow: TimeInterval = 0.1
 
     func togglePlayPause() {
         // The triple-press display re-sync is checked FIRST, before every other
@@ -10797,7 +10845,28 @@ final class PlayerViewModel: ObservableObject {
         // Hybrid cache live: local reads make the dense pass cheap, so cover
         // a much wider stretch around the finger — scrubbing through cached
         // film should feel continuous, not sampled.
-        let cached = url.host == "127.0.0.1" && MediaCacheServer.shared.hasLiveSession
+        var cached = url.host == "127.0.0.1" && MediaCacheServer.shared.hasLiveSession
+        // NOTHING ON DISK UNDER THE FINGER: READ THE ORIGIN.
+        //
+        // The cache-only lane can only answer for film the window holds, and
+        // the window is a few minutes around the playhead on a big remux — so
+        // scrubbing anywhere else found no cached span, this pass stood down,
+        // and the window fell back to the whole-film set: one frame every 30-60
+        // seconds, the same still through an entire fine-tuning turn. The
+        // un-cached session already does exactly what is needed here — a slot
+        // pass over the network — so do that, straight against the ORIGIN.
+        // Never through the proxy's main lane: a reader there would drag the
+        // download pool to wherever the finger happens to be.
+        var originLane: URL?
+        if cached, duration > 0,
+           !MediaCacheServer.shared.coveredFractions.contains(where: {
+               $0.start * duration <= target && target <= $0.end * duration
+           }),
+           let origin = currentEntry.stream.url.flatMap(URL.init(string:)),
+           origin.scheme?.hasPrefix("http") == true {
+            cached = false
+            originLane = origin
+        }
         // 480 SECONDS OF DENSE FRAMES WAS TOO MUCH TO ASK OF THIS BOX. At one
         // frame every two seconds that is 240 software-decoded 4K keyframes,
         // uncapped — the coarse pass has capped itself at 120 all along — and
@@ -10833,16 +10902,26 @@ final class PlayerViewModel: ObservableObject {
         // uncovered slot fails fast and is simply skipped).
         if cached, let thumbURL = MediaCacheServer.shared.thumbnailURL {
             url = thumbURL
+        } else if let originLane {
+            url = originLane
         }
 
         PlayerProbe.event("preview", String(format: "fine pass -> centre %.0f (+/-%.0fs, %@)",
-                                            target, half, cached ? "from cache" : "over network"))
+                                            target, half, cached ? "from cache"
+                                                : (originLane != nil ? "from origin — not cached here" : "over network")))
         fineCenter = target
         fineCenterWasFineTuning = fineTuning
         fineTask?.cancel()
         fineThumbnailer?.cancel()
         var lower = max(target - half, 0)
         var upper = min(target + half, max(duration - 1, 0))
+        // The unclamped window, for the origin retry below.
+        let originWindow = lower...max(upper, lower)
+        let originRetry: URL? = cached
+            ? currentEntry.stream.url.flatMap(URL.init(string:)).flatMap {
+                $0.scheme?.hasPrefix("http") == true ? $0 : nil
+            }
+            : nil
         // CLAMP TO FILM THAT IS ACTUALLY ON DISK.
         //
         // The dense pass reads through the cache-only lane, which answers an
@@ -10889,26 +10968,44 @@ final class PlayerViewModel: ObservableObject {
             // network, and it stands itself down on hardware that can't hold
             // the pace (`sweepFloorFPS`), leaving the slot pass to fill the
             // window at the old density.
-            let fine = ScrubThumbnailer(url: url, count: count,
-                                        budgetSeconds: cached ? 60 : 30,
-                                        headers: headers, range: lower...upper,
-                                        denseSpacing: fineTuning && cached
-                                            ? ScrubThumbnailer.fineSweepSeconds : nil,
-                                        denseCenter: target,
-                                        shouldProceed: proceed)
-            await MainActor.run { self?.fineThumbnailer = fine }
-            let thumbs = await fine.generate { partial in
-                Task { @MainActor [weak self] in
-                    guard let self, self.fineThumbnailer === fine else { return }
-                    self.mergeFine(partial)
+            //
+            // AND IF THE DISK CAME BACK NEARLY EMPTY, ASK THE ORIGIN. "Cached
+            // here" is judged by mapping the cache's BYTE spans onto time
+            // linearly, which drifts on a variable-bitrate file — a window that
+            // looks covered in seconds can be mostly missing in bytes, and the
+            // pass then decodes four frames out of sixty. A second, network slot
+            // pass over the same window fills it the way an un-cached session
+            // would. Only after a short-changed cache pass, so the common case
+            // never touches the network.
+            var lanes: [(url: URL, range: ClosedRange<Double>, fromCache: Bool)] =
+                [(url, lower...upper, cached)]
+            if let originRetry { lanes.append((originRetry, originWindow, false)) }
+            for lane in lanes {
+                let fine = ScrubThumbnailer(url: lane.url, count: count,
+                                            budgetSeconds: lane.fromCache ? 60 : 30,
+                                            headers: headers, range: lane.range,
+                                            denseSpacing: fineTuning && lane.fromCache
+                                                ? ScrubThumbnailer.fineSweepSeconds : nil,
+                                            denseCenter: target,
+                                            shouldProceed: proceed)
+                await MainActor.run { self?.fineThumbnailer = fine }
+                let thumbs = await fine.generate { partial in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.fineThumbnailer === fine else { return }
+                        self.mergeFine(partial)
+                    }
                 }
-            }
-            await MainActor.run {
-                guard let self, self.fineThumbnailer === fine else { return }
-                self.fineThumbnailer = nil
-                PlayerProbe.event("preview", "fine pass done — \(thumbs.count) frames"
-                    + " (\(self.fineThumbnails.count) held)")
-                self.mergeFine(thumbs)
+                let current = await MainActor.run { () -> Bool in
+                    guard let self, self.fineThumbnailer === fine else { return false }
+                    self.fineThumbnailer = nil
+                    PlayerProbe.event("preview", "fine pass done — \(thumbs.count) frames"
+                        + " (\(self.fineThumbnails.count) held)"
+                        + (lane.fromCache ? "" : (cached ? " [origin retry]" : "")))
+                    self.mergeFine(thumbs)
+                    return true
+                }
+                guard current, !Task.isCancelled,
+                      lane.fromCache, thumbs.count < max(2, count / 4) else { return }
             }
         }
     }
@@ -11922,7 +12019,8 @@ final class DVEmbeddedSubtitleInfo: SubtitleInfo {
     /// Append one live cue: truncate any still-open part it supersedes,
     /// dedup re-decoded cues after a backward seek, keep sorted, and prune
     /// far-behind parts so PGS images don't accumulate for a whole movie.
-    func add(start: Double, end: Double, text: String?, image: UIImage?, playhead: Double) {
+    func add(start: Double, end: Double, text: String?, image: UIImage?,
+             origin: CGPoint = .zero, canvas: CGSize = .zero, playhead: Double) {
         if text == nil, image == nil {   // clear marker
             for part in parts.reversed() where part.end > start && part.start <= start {
                 part.end = start
@@ -11931,6 +12029,8 @@ final class DVEmbeddedSubtitleInfo: SubtitleInfo {
         }
         let part = SubtitlePart(start, end, attributedString: text.map { NSAttributedString(string: $0) })
         part.image = image
+        part.origin = origin
+        part.canvasSize = canvas
         if let idx = parts.lastIndex(where: { abs($0.start - start) < 0.01 && ($0.image != nil) == (image != nil) }) {
             parts[idx] = part
         } else {

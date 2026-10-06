@@ -33,6 +33,8 @@ final class SearchViewModel: ObservableObject {
             // the same search could come back in a different order twice in a
             // row. Now the order is the one `searchTargets` decided.
             var byTarget = [Int: [MetaItem]](minimumCapacity: targets.count)
+            var published = 0
+            var shown: [MetaItem] = []
             await withTaskGroup(of: (Int, [MetaItem]).self) { group in
                 for (index, target) in targets.enumerated() {
                     // Resolved out here: the class is @MainActor, so the
@@ -47,24 +49,73 @@ final class SearchViewModel: ObservableObject {
                         return (index, Array(items.prefix(cap)))
                     }
                 }
-                for await (index, items) in group { byTarget[index] = items }
-            }
-            guard !Task.isCancelled else { return }
-
-            var merged: [MetaItem] = []
-            var seen = Set<String>()
-            for index in targets.indices {
-                // Keyed on `id` alone: the grids' `ForEach` identify rows by
-                // `MetaItem.id`, so "tt123" as `series` from one addon and
-                // as `tv` from another must not both survive.
-                for item in byTarget[index] ?? [] where !seen.contains(item.id) {
-                    seen.insert(item.id)
-                    merged.append(item)
+                // PUBLISH AS THE LEADING ADD-ONS ANSWER. Holding every result
+                // until the slowest add-on was done made one slow source the
+                // speed of the whole search: the beamup TMDB add-on answers a
+                // search with an HTTP error after ~13s (measured 2026-10-02),
+                // so every query sat on "Searching" that long while Cinemeta
+                // had answered in 0.2s. Only the contiguous run of finished
+                // targets from the top is shown, so results never reshuffle
+                // underneath the viewer when an earlier add-on lands late.
+                for await (index, items) in group {
+                    byTarget[index] = items
+                    var ready = published
+                    while ready < targets.count, byTarget[ready] != nil { ready += 1 }
+                    if ready > published, !Task.isCancelled {
+                        shown = Self.merge(byTarget, from: published, upTo: ready,
+                                           after: shown, query: trimmed)
+                        published = ready
+                        results = shown
+                    }
                 }
             }
-            results = merged
+            guard !Task.isCancelled else { return }
+            // Normally the last publish already said this; it matters when no
+            // target ever published (no search-capable add-on at all), which
+            // would otherwise leave the PREVIOUS query's results on screen.
+            results = shown
             isSearching = false
         }
+    }
+
+    /// `shown` followed by the results of targets `from..<upTo` it doesn't
+    /// already hold, de-duplicated, in target order — then, within that new
+    /// batch, titles named exactly what was typed first and titles starting
+    /// with it next. Add-on search ranking is loose: Cinemeta returns "The
+    /// Secret" (2006 and 2007) twentieth and twenty-first for "the secret",
+    /// behind "Kingsman: The Secret Service" and "Marrowbone".
+    ///
+    /// Only the NEW batch is ranked. Re-ranking everything each time an add-on
+    /// landed moved an exact match from a late add-on above results the viewer
+    /// was already looking at — and possibly focused on.
+    private static func merge(_ byTarget: [Int: [MetaItem]], from: Int, upTo: Int,
+                              after shown: [MetaItem], query: String) -> [MetaItem] {
+        var merged: [MetaItem] = []
+        var seen = Set(shown.map(\.id))
+        for index in from ..< upTo {
+            // Keyed on `id` alone: the grids' `ForEach` identify rows by
+            // `MetaItem.id`, so "tt123" as `series` from one addon and
+            // as `tv` from another must not both survive.
+            for item in byTarget[index] ?? [] where !seen.contains(item.id) {
+                seen.insert(item.id)
+                merged.append(item)
+            }
+        }
+        func normalized(_ text: String) -> String {
+            text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let wanted = normalized(query)
+        func tier(_ item: MetaItem) -> Int {
+            let name = normalized(item.name)
+            if name == wanted { return 0 }
+            if name.hasPrefix(wanted) { return 1 }
+            return 2
+        }
+        // Stable: within a tier, the add-ons' own order is kept.
+        return shown + merged.enumerated()
+            .sorted { (tier($0.element), $0.offset) < (tier($1.element), $1.offset) }
+            .map(\.element)
     }
 
     /// Most results one catalog may contribute to a search.

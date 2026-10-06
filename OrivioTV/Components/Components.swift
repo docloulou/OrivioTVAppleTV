@@ -513,13 +513,19 @@ struct RemoteImage: View {
     /// Hard decode cap in PIXELS on the longest side, for full-bleed art that
     /// has no point size to derive from (see `PerformanceProfile.backdropPixelCap`).
     var maxPixels: CGFloat? = nil
+    /// Tried in order when `url` does not load. An episode still that exists
+    /// as a URL but 404s — the normal state of an episode that hasn't aired —
+    /// used to leave the card on its loading shimmer for good; with the show's
+    /// own art here the card falls back to it instead.
+    var fallbackURLs: [String] = []
 
     @State private var image: UIImage?
     @State private var shownKey: String?
 
     init(url: String?, contentMode: ContentMode = .fill, alignment: Alignment = .center,
-         maxDimension: CGFloat? = nil, maxPixels: CGFloat? = nil) {
+         maxDimension: CGFloat? = nil, maxPixels: CGFloat? = nil, fallbackURLs: [String] = []) {
         self.url = url
+        self.fallbackURLs = fallbackURLs.filter { !$0.isEmpty && $0 != url }
         self.contentMode = contentMode
         self.alignment = alignment
         self.maxDimension = maxDimension
@@ -547,7 +553,21 @@ struct RemoteImage: View {
             }
         }
         .clipped()
-        .task(id: url) { await load(url) }
+        .task(id: url) { await loadWithFallbacks() }
+    }
+
+    private func loadWithFallbacks() async {
+        if await load(url) || url == nil && fallbackURLs.isEmpty { return }
+        for candidate in fallbackURLs {
+            guard !Task.isCancelled else { return }
+            if await load(candidate) { return }
+        }
+        // NOTHING LOADED. Whatever is still on screen belongs to the url this
+        // view showed BEFORE — a card reused for another title keeps the
+        // previous title's art. Fall back to the placeholder instead.
+        guard !Task.isCancelled, let shownKey, shownKey != url,
+              !fallbackURLs.contains(shownKey) else { return }
+        show(nil, key: nil, duration: 0.2)
     }
 
     /// Pixel budget for the decode (longest side), from the rendered size
@@ -601,31 +621,34 @@ struct RemoteImage: View {
         }
     }
 
-    private func load(_ value: String?) async {
+    /// True once `value` is on screen (or already was); false when it could
+    /// not be loaded, so the caller can try a fallback.
+    @discardableResult
+    private func load(_ value: String?) async -> Bool {
         guard let value, let parsed = URL(string: value) else {
-            show(nil, key: nil, duration: 0.2)
-            return
+            if fallbackURLs.isEmpty { show(nil, key: nil, duration: 0.2) }
+            return false
         }
-        if value == shownKey { return }
+        if value == shownKey { return true }
         if let cached = ImageCache.shared.image(for: memoryKey(value)) {
             show(cached, key: value, duration: 0.28)
-            return
+            return true
         }
         // Disk hit: survives relaunch, so a previously seen poster shows without
         // a network round-trip.
         if let disk = await ImageCache.shared.diskImage(
             for: value, budget: pixelBudget, memoryKey: memoryKey(value)
         ) {
-            if Task.isCancelled { return }
+            if Task.isCancelled { return true }
             show(disk, key: value, duration: 0.28)
-            return
+            return true
         }
         // Keep the current image visible while the replacement downloads.
         // Coalesced: the same poster can appear in two rows at once, or race the
         // prefetch already fetching it, and each of those used to be its own
         // download.
-        guard let data = try? await ImageCache.shared.download(parsed),
-              !Task.isCancelled else { return }
+        guard let data = try? await ImageCache.shared.download(parsed) else { return false }
+        if Task.isCancelled { return true }
         // Decode off the render path (UIKit otherwise decodes lazily on first
         // draw — a scroll hitch per newly visible poster), downsampled to this
         // view's own pixel budget (a poster card must not decode a full-res
@@ -633,10 +656,11 @@ struct RemoteImage: View {
         let budget = pixelBudget
         guard let prepared = await Task.detached(priority: .userInitiated, operation: {
             ImageCache.decodeDownsampled(data, budget: budget)
-        }).value else { return }
-        if Task.isCancelled { return }
+        }).value else { return false }
+        if Task.isCancelled { return true }
         ImageCache.shared.insert(prepared, for: value, data: data, memoryKey: memoryKey(value))
         show(prepared, key: value, duration: 0.35)
+        return true
     }
 
     private var placeholder: some View {
@@ -960,6 +984,11 @@ struct LandscapeCard: View {
     var watched: Bool = false
     var rating: String? = nil
     var width: CGFloat = 380
+    /// Art to fall back to when `imageURL` won't load — see
+    /// `RemoteImage.fallbackURLs`.
+    var fallbackImageURLs: [String] = []
+    /// A short "5d" countdown to the show's next episode, top-leading.
+    var upcomingText: String? = nil
     var subtitleBehavior: LandscapeSubtitleBehavior = .compact
     var detailLine: String? = nil
     var remainingText: String? = nil
@@ -976,7 +1005,7 @@ struct LandscapeCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
             ZStack(alignment: .bottom) {
-                RemoteImage(url: imageURL, maxDimension: width)
+                RemoteImage(url: imageURL, maxDimension: width, fallbackURLs: fallbackImageURLs)
                     .aspectRatio(16 / 9, contentMode: .fill)
                     // Attach `.blur` ONLY on the rare spoiler card. Applied
                     // unconditionally (even at radius 0) it forces every card
@@ -997,6 +1026,7 @@ struct LandscapeCard: View {
             .clipShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
             .overlay(alignment: .topLeading) {
                 if let rating { RatingBadge(rating: rating).padding(10) }
+                else if let upcomingText { UpcomingEpisodeBadge(text: upcomingText).padding(10) }
             }
             .overlay(alignment: .topTrailing) {
                 if newEpisodeCount > 0 {
@@ -1203,6 +1233,33 @@ private struct NewEpisodeBadge: View {
             )
             .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
             .accessibilityLabel(count == 1 ? "1 new episode" : "\(count) new episodes")
+    }
+}
+
+/// "5d" — how long until the show's next episode airs (Settings → Layout →
+/// "Upcoming episode countdown"). Same pill shape as the new-episode badge,
+/// in a dark glass so the two never read as the same signal.
+private struct UpcomingEpisodeBadge: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "calendar")
+                .font(.system(size: 13, weight: .bold))
+            Text(text)
+                .font(.system(size: 15, weight: .heavy, design: .rounded))
+                .monospacedDigit()
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 9)
+        .frame(height: 26)
+        .background(.black.opacity(0.62), in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(.white.opacity(0.22), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
+        .accessibilityLabel("Next episode \(text)")
     }
 }
 
