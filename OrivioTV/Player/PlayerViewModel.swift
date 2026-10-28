@@ -1256,9 +1256,12 @@ final class PlayerViewModel: ObservableObject {
     /// active; a failure hands the same source to the legacy routing once.
     private(set) var aetherEngine: AetherPlaybackEngine?
     var usingAether: Bool { aetherEngine != nil }
-    /// Entries AetherEngine already failed on this session: the legacy
+    /// Links AetherEngine already failed on this session: the legacy
     /// routing plays them from then on (no Aether retry loop).
-    private var aetherDeclinedEntryIDs: Set<UUID> = []
+    /// Keyed by the LINK, not `StreamEntry.id`: that UUID is minted on every
+    /// init, so a failover or a source refresh handing back the same URL
+    /// would have bought another full watchdog wait on it.
+    private var aetherDeclinedLinks: Set<String> = []
     /// The first-playback setup ran for THIS load (see `vlcSessionPrepared`
     /// for why `hasStartedPlayback` cannot stand in for it).
     private var aetherSessionPrepared = false
@@ -1776,7 +1779,9 @@ final class PlayerViewModel: ObservableObject {
     /// Atmos is an audio feature and a TV with no DV mode has nothing to do
     /// with it.
     private func shouldTryDVFirst(url: URL) -> Bool {
-        guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+        // .aether reaches here only once AetherEngine declined the link, and
+        // from then on it routes exactly like Auto.
+        guard effectiveEngine == .auto || effectiveEngine == .aether || effectiveEngine == .ffmpeg,
               !url.isFileURL,
               Self.memoryFootprintMB() < 850,
               !dvFailedURLs.contains(retryKey(for: url)),
@@ -3621,7 +3626,7 @@ final class PlayerViewModel: ObservableObject {
         // calls this synchronously. A DV-first attempt in flight is the same
         // case: `fallBackFromDirect` runs the probe if the attempt declines.
         guard playerLayer != nil || !hasDVFirstAttemptInFlight else { return }
-        guard effectiveEngine == .auto || effectiveEngine == .ffmpeg,
+        guard effectiveEngine == .auto || effectiveEngine == .aether || effectiveEngine == .ffmpeg,
               let url = currentEntry.stream.url,
               !probedURLs.contains(url) else { return }
         let wantASS = settings.fullAssSubtitles
@@ -4247,7 +4252,7 @@ final class PlayerViewModel: ObservableObject {
         // legacy one; a scheme or manifest only FFmpeg opens skips it too.
         if overrideURL == nil, !forceDemuxerForSession,
            effectiveEngine == .aether || (effectiveEngine == .auto && activeMode != .compatibility),
-           !aetherDeclinedEntryIDs.contains(entry.id) {
+           !aetherDeclinedLinks.contains(Self.aetherLinkKey(entry)) {
             decisionLog.record("Engine", "AetherEngine",
                                because: effectiveEngine == .aether
                                    ? "selected as the playback engine"
@@ -8648,7 +8653,11 @@ final class PlayerViewModel: ObservableObject {
 
     /// Reload the current stream through a different engine, keeping position.
     func switchEngine(_ engine: PlayerEngine) {
-        guard engine != effectiveEngine else {
+        // Picking AetherEngine (or Auto) while it is already the selection but
+        // declined this link is the viewer asking for another try, not a no-op.
+        let retriesAether = (engine == .aether || engine == .auto) && !usingAether
+            && aetherDeclinedLinks.contains(Self.aetherLinkKey(currentEntry))
+        guard engine != effectiveEngine || retriesAether else {
             overlay = .none
             return
         }
@@ -8656,7 +8665,7 @@ final class PlayerViewModel: ObservableObject {
         enginePickedThisSession = true
         // Asking for AetherEngine by name is a fresh chance for a link it
         // declined earlier this session.
-        if engine == .aether || engine == .auto { aetherDeclinedEntryIDs.remove(currentEntry.id) }
+        if engine == .aether || engine == .auto { aetherDeclinedLinks.remove(Self.aetherLinkKey(currentEntry)) }
         PlaybackMemory.update(meta.id) { $0.engine = engine.rawValue }
         overlay = .none
         let resumeAt = resumeTargetForReload
@@ -8806,7 +8815,10 @@ final class PlayerViewModel: ObservableObject {
             // failing over just marched through sources on the same broken
             // engine. Retry the SAME source on Auto first, and clear the
             // per-title engine memory so the trap doesn't re-arm next time.
-            if self.effectiveEngine != .auto, self.sessionEngine != nil || PlaybackMemory.memory(for: self.meta.id)?.engine != nil {
+            // (Not for AetherEngine: it already handed this link to the Auto
+            // routing, so "retrying on Auto" would replay the same attempt.)
+            if self.effectiveEngine != .auto, self.effectiveEngine != .aether,
+               self.sessionEngine != nil || PlaybackMemory.memory(for: self.meta.id)?.engine != nil {
                 self.showToast("\(self.effectiveEngine.label) engine didn't start — retrying on Auto")
                 Self.dvTrail("forced engine \(self.effectiveEngine.label) never started — clearing memory, retrying on Auto")
                 self.sessionEngine = nil
@@ -9113,9 +9125,15 @@ final class PlayerViewModel: ObservableObject {
             return
         }
         // AetherEngine stalled/died/never started → the legacy engines get
-        // the SAME source first, once. Not for an origin that refuses byte
-        // ranges: no engine can play that link, so it is a source failure.
-        if usingAether, (error as NSError).domain != "OrivioCache" {
+        // the SAME source first, once. Not for a failure of the LINK itself —
+        // an origin that refuses byte ranges, or a debrid notice clip served
+        // instead of the film (whose check only fires once per URL, so a
+        // same-link reload would play the notice to its end): no engine can
+        // play those, so they go straight to source failover.
+        let nsError = error as NSError
+        let linkFailure = nsError.domain == "OrivioCache"
+            || (nsError.domain == "Orivio.Player" && nsError.code == -20)
+        if usingAether, !linkFailure {
             isFailingOver = false
             isSwitchingSource = false
             fallBackFromAether(entry: currentEntry, reason: error.localizedDescription)
@@ -10239,6 +10257,9 @@ final class PlayerViewModel: ObservableObject {
     func prepareForExit() {
         guard !isExiting else { return }
         isExiting = true
+        // Before `exitDisplaySettleDelay` is read: an AetherEngine session may
+        // have moved the panel without ever reaching a first frame.
+        if aetherEngine != nil { noteAetherDisplay() }
         endAdvanceLadder()
         PlayerProbe.event("player", "exit")
         unregisterProbes()
@@ -12261,7 +12282,7 @@ extension PlayerViewModel {
             do {
                 engine = try AetherPlaybackEngine()
             } catch {
-                aetherDeclinedEntryIDs.insert(entry.id)
+                aetherDeclinedLinks.insert(Self.aetherLinkKey(entry))
                 load(entry: entry)
                 // After the reload: `load` resets the decision log.
                 decisionLog.record("Engine", "AetherEngine unavailable",
@@ -12296,7 +12317,9 @@ extension PlayerViewModel {
         engine.onSubtitleCues = { [weak self, weak engine] cues in
             guard let self, let engine, self.aetherEngine === engine,
                   let active = self.aetherActiveEmbeddedSub else { return }
-            active.replace(with: cues)
+            // On the remote-HLS route AVPlayer draws the rendition itself;
+            // feeding the overlay too would double every caption.
+            active.replace(with: engine.subtitlesDrawnByPlayer ? [] : cues)
         }
         engine.onVideoInfoChanged = { [weak self, weak engine] in
             guard let self, let engine, self.aetherEngine === engine else { return }
@@ -12342,6 +12365,10 @@ extension PlayerViewModel {
         PlayerProbe.event("load", "aether start host=\(url.host ?? "?") resume=\(Int(resume))")
         NSLog("[OrivioPlayer] load start engine=AetherEngine url-host=%@", url.host ?? "?")
         videoRefreshID = UUID()   // attach the engine's view
+    }
+
+    private static func aetherLinkKey(_ entry: StreamEntry) -> String {
+        entry.stream.url ?? entry.rejectionKey
     }
 
     /// The per-load engine knobs, from what this Apple TV, its route and the
@@ -12399,6 +12426,7 @@ extension PlayerViewModel {
     private func aetherStateChanged(_ state: AetherPlaybackState, entry: StreamEntry) {
         // Exiting: swallow only — teardown() stops the engine at dismissal.
         if isExiting { return }
+        noteAetherDisplay()
         let tag = "\(state)"
         if tag != lastAetherProbeState {
             lastAetherProbeState = tag
@@ -12569,9 +12597,16 @@ extension PlayerViewModel {
 
     /// The engine owns the HDMI handshake; the exit path still has to know
     /// one happened so it releases the panel behind its cover.
+    ///
+    /// Read off the display manager itself, not off the first frame: the
+    /// engine writes the criteria synchronously BEFORE the item is assigned,
+    /// so a load that fails (or an exit) before any frame has already moved
+    /// the panel. Called at every point an Aether session can end.
     private func noteAetherDisplay() {
-        guard let engine = aetherEngine, !displayCriteriaApplied, engine.mayHaveSwitchedDisplay,
-              UIApplication.shared.ks_keyWindow?.avDisplayManager.isDisplayCriteriaMatchingEnabled == true
+        guard !displayCriteriaApplied,
+              let manager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
+              manager.isDisplayCriteriaMatchingEnabled,
+              manager.preferredDisplayCriteria != nil
         else { return }
         displayCriteriaApplied = true
     }
@@ -12587,7 +12622,7 @@ extension PlayerViewModel {
             sessionResumeFloor = max(sessionResumeFloor, resumeAt)
             pendingResume = resumeAt
         }
-        aetherDeclinedEntryIDs.insert(entry.id)
+        aetherDeclinedLinks.insert(Self.aetherLinkKey(entry))
         PlayerProbe.event("aether", "fallback — \(reason)")
         retireAetherEngine()
         load(entry: entry)
@@ -12600,13 +12635,21 @@ extension PlayerViewModel {
     /// Shut the engine down for a hand-off to another engine.
     private func retireAetherEngine() {
         guard let engine = aetherEngine else { return }
+        // Its criteria stay on the panel after the hand-off (the next engine
+        // may never write any), so the exit must still release them.
+        noteAetherDisplay()
         engine.onState = nil
         engine.onBuffering = nil
         engine.onTime = nil
         engine.onTracksChanged = nil
         engine.onSubtitleCues = nil
         engine.onVideoInfoChanged = nil
-        engine.stop(final: false)
+        // FINAL, though another engine follows: this instance is being thrown
+        // away, and only a final stop unbinds its view, drops its observers
+        // and leaves the engine's shared-output registry. The audio session
+        // is untouched either way (deactivatesAudioSessionOnStop is off), and
+        // the display criteria are never reset by our stop.
+        engine.stop(final: true)
         aetherEngine = nil
         // Its embedded-subtitle infos die with it (the DV path's stale-cue bug).
         if subtitleModel.selectedSubtitleInfo is AetherEmbeddedSubtitleInfo {

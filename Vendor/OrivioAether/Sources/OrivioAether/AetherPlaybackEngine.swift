@@ -245,9 +245,11 @@ public final class AetherPlaybackEngine {
         Task { @MainActor [weak self] in await self?.engine.seek(to: target) }
     }
 
-    /// Stop the session. `final` means leaving playback (the audio session
-    /// may deactivate, the view is unbound); a non-final stop hands off to
-    /// another engine on the same source.
+    /// Stop the session. `final` means this instance is done for good: the
+    /// view is unbound, the observers dropped and the engine leaves its
+    /// shared-output registry. The audio session stays active either way
+    /// (`deactivatesAudioSessionOnStop` is left off: the host owns it). A
+    /// non-final stop keeps the instance ready for another `load`.
     ///
     /// The display criteria are NEVER reset here: the player screen releases
     /// the panel itself (`releaseDisplayForExit`), behind its opaque exit
@@ -264,13 +266,6 @@ public final class AetherPlaybackEngine {
             subscriptions.removeAll()
             engine.unbind(view: playerView)
         }
-    }
-
-    /// True once the engine has written display criteria for this session
-    /// (Match Content on and a picture up), so the host knows an exit has a
-    /// handshake to release.
-    public var mayHaveSwitchedDisplay: Bool {
-        engine.hasFirstFrameReadyForDisplay && engine.videoRoute != .audio && engine.videoRoute != .none
     }
 
     /// Keep the current AVPlayerItem on screen across the next `load` (episode
