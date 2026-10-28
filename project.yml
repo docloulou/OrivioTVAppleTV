@@ -1,7 +1,8 @@
 name: OrivioTV
 options:
   deploymentTarget:
-    tvOS: "17.0"
+    # 18.0: AetherEngine (Vendor/OrivioAether) is tvOS 18+.
+    tvOS: "18.0"
   createIntermediateGroups: true
 packages:
   # VENDORED with two Orivio patches (see "ORIVIO PATCH" comments): a
@@ -28,6 +29,14 @@ packages:
   VLCKit:
     url: https://github.com/tylerjonesio/vlckit-spm
     from: 3.6.0
+  # AetherEngine (superuser404notfound/AetherEngine) behind a DYNAMIC wrapper
+  # framework. The app already links a static FFmpeg (KSPlayer's FFmpegKit)
+  # and VLCKit's; AetherEngine must bind to its own AetherLib* FFmpeg, which
+  # only holds when its code lives in a separate image (two-level namespace).
+  # The wrapper's manifest is also where AetherEngine's package traits are
+  # switched on — XcodeGen cannot pass `traits:` itself. Needs Xcode 16.3+.
+  OrivioAether:
+    path: Vendor/OrivioAether
 targets:
   OrivioTV:
     type: application
@@ -39,6 +48,7 @@ targets:
       - package: YouTubeKit
       - package: VLCKit
         product: VLCKitSPM
+      - package: OrivioAether
       # libdovi (quietvoid/dovi_tool's dolby_vision crate, C API) —
       # cross-compiled Rust static lib for tvOS. Powers Dolby Vision
       # Profile 7 (dual-layer) → 8.1 RPU conversion so DV7 remuxes get

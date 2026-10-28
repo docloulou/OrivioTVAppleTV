@@ -21,7 +21,7 @@ Grab the latest `.ipa` from [Releases](../../releases):
 - **`OrivioTV-0.7.15-tvos.ipa`** — for **Xcode** (Devices & Simulators) or **Apple
   Configurator**.
 
-Both are the same unsigned arm64 tvOS build (Apple TV HD / 4K, tvOS 17+); the sideload tool
+Both are the same unsigned arm64 tvOS build (Apple TV HD / 4K, tvOS 18+); the sideload tool
 re-signs with your Apple ID on install.
 
 The upstream app is Kotlin + Jetpack Compose + ExoPlayer/mpv, so nothing could be reused
@@ -74,7 +74,33 @@ Dual-engine playback with a fully custom UI:
 
 ## Building
 
-Requires Xcode 16+ with the tvOS platform installed, plus [XcodeGen](https://github.com/yonaskolb/XcodeGen).
+Requires Xcode 16.3+ (Swift 6.1, for SwiftPM package traits) with the tvOS platform
+installed, plus [XcodeGen](https://github.com/yonaskolb/XcodeGen). The deployment target is
+tvOS 18.
+
+### Playback engines
+
+Auto (the default in Settings → Playback → Playback engine) opens every stream with
+[AetherEngine](https://github.com/superuser404notfound/AetherEngine): MKV, MP4, HLS and the
+rest, hardware decode through AVPlayer where tvOS can and its own Metal route where it
+cannot (AV1, VC-1, MPEG-2, Hi10P…), the panel's native Dolby Vision (Profile 5 / 7 / 8),
+HDR10+ and HLG modes, E-AC-3 Atmos passthrough, a lossless LPCM bridge for TrueHD / DTS-HD MA
+on a 7.1 route, and TrueHD Atmos / DTS:X objects rendered into a 7.1.4 bed on tvOS 26+. A link
+it cannot play is reloaded once through the previous engines (AVPlayer for MP4/HLS, FFmpeg via
+KSPlayer for the rest), then normal source failover applies. The player UI is the same for
+every engine.
+
+AetherEngine is linked through the local package `Vendor/OrivioAether`, a dynamic framework, so
+its FFmpeg stays separate from the FFmpeg KSPlayer links statically (see the comment in
+`Vendor/OrivioAether/Package.swift`). That manifest turns on the engine's optional components
+(`TrueHDObjectAudio`, `DTSXObjectAudio`, `DualLayerDolbyVision`, `DolbyVisionStillReshaping`).
+They may be subject to third-party patent licensing; whoever distributes a build is
+responsible for that licensing. AetherEngine is LGPL-3.0 with an App Store exception, its
+FFmpeg frameworks are LGPL-2.1-or-later, libdovi (quietvoid) is MIT, and the TrueHD decoder
+(LibTrueHD / truehdd) is MIT + Apache-2.0: ship their license texts and notices with any
+distributed build (details in the AetherEngine README, "License").
+
+Xcode resolves the package on the first build (`Package.resolved` is not committed for it).
 
 Provider keys are kept out of source control (like the Android app's
 `local.properties`). Before building, copy the template and fill in any keys you
