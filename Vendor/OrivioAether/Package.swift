@@ -26,8 +26,9 @@ import PackageDescription
 //    for its own licensing (AetherEngine README, "Optional components").
 //
 // The app only ever imports `OrivioAether`; its public API is made of
-// Orivio-defined types, so nothing in the app sees AetherEngine, LibDovi or
-// the Aether FFmpeg headers (the app has its own `libdovi` module).
+// Orivio-defined types and the module is built with library evolution (see
+// the target below), so nothing in the app sees AetherEngine, LibDovi or the
+// Aether FFmpeg headers (the app has its own `libdovi` module).
 let package = Package(
     name: "OrivioAether",
     platforms: [
@@ -49,7 +50,20 @@ let package = Package(
         .target(
             name: "OrivioAether",
             dependencies: [.product(name: "AetherEngine", package: "AetherEngine")],
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+                // Library evolution is what keeps `internal import AetherEngine`
+                // out of the app: a client of a NON-resilient module still
+                // loads that module's internal imports (SE-0409), and
+                // AetherEngine imports its FFmpeg as AetherLibavcodec & co.
+                // Those headers declare the same C enums and structs as
+                // KSPlayer's Libavcodec, which the app imports, and clang
+                // rejects the two definitions ("'AV_CODEC_ID_…' from module
+                // 'AetherLibavcodec' is not present in definition of 'enum
+                // AVCodecID' in module 'Libavcodec'"). Allowed here because
+                // this is a local package.
+                .unsafeFlags(["-enable-library-evolution"]),
+            ]
         ),
     ]
 )

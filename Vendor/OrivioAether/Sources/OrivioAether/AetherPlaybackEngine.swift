@@ -3,14 +3,18 @@ import Combine
 import CoreGraphics
 import Foundation
 import UIKit
-// INTERNAL on purpose: nothing below exposes an AetherEngine type, so the app
-// that imports this module never loads AetherEngine's module, its FFmpeg
-// headers or LibDovi's `Dovi` (see Package.swift for why that matters).
+// INTERNAL on purpose: nothing below exposes an AetherEngine type, and with
+// the module built with library evolution the app that imports it never loads
+// AetherEngine's module, its FFmpeg headers or LibDovi's `Dovi` (see
+// Package.swift for why that matters).
 internal import AetherEngine
 
 // MARK: - Public, Orivio-defined value types
 
 /// What the engine is doing, reduced to what the player screen acts on.
+/// Frozen so the app's exhaustive switch needs no `@unknown default` now that
+/// the module is resilient.
+@frozen
 public enum AetherPlaybackState: Equatable, Sendable {
     case idle
     case loading
