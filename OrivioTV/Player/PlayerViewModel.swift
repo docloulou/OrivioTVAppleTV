@@ -8679,6 +8679,9 @@ final class PlayerViewModel: ObservableObject {
     /// Fetch every stream for the current title from the installed stream
     /// addons. Torrent entries are kept only when a debrid resolver exists.
     private func fetchAvailableSources(forceRefresh: Bool = false) async -> [StreamEntry] {
+        // A dev test stream has no add-on alternates: a failure should end on
+        // the error screen, not sweep every add-on for an id none of them know.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else { return allEntries }
         let id = currentVideo?.id ?? meta.id
         let type = meta.type
         let hasResolver = torrentResolver != nil
@@ -9045,6 +9048,9 @@ final class PlayerViewModel: ObservableObject {
         // entry, so a real addon that happens to be NAMED "Demo" keeps its
         // notice protection.
         guard !(PlayerDevFlags.playerDemo && currentEntry.addonName == "Demo") else { return }
+        // The Settings test streams include short clips (a 10 MB DTS sample),
+        // and their ids are not ones a failover could ever re-scrape.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else { return }
         guard !isExiting, isNoticeClip(seconds) else { return }
         // Above the dedup guard, because the suppression is per LOAD while the
         // guard's set is per SESSION: `resetPerLoadSessionState` clears the flag

@@ -7,6 +7,9 @@ struct PerformanceSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var playerStore: PlayerSettingsStore
     @ObservedObject private var store = PerformanceSettingsStore.shared
+    @State private var showTestStreams = false
+    /// The test picked in the cover; launched once the cover has dismissed.
+    @State private var pendingTestStream: PlaybackRequest?
 
     private var s: Binding<PerformanceSettingsStore.Settings> {
         Binding(get: { store.settings }, set: { store.settings = $0 })
@@ -156,6 +159,14 @@ struct PerformanceSettingsDetail: View {
                     isOn: s.showFPSOverlay
                 )
 
+                PerfActionRow(
+                    icon: "play.rectangle.on.rectangle",
+                    title: "Test streams",
+                    subtitle: "Play public sample files — Dolby Vision 5 / 8.1 / 8.4, HDR10, HLG, TrueHD Atmos, DTS-HD MA, AV1, PGS and ASS subtitles — or any URL of your own, through the current player engine. Nothing reaches Continue Watching or Trakt."
+                ) {
+                    showTestStreams = true
+                }
+
                 PerfToggleRow(
                     icon: "hand.tap",
                     title: "Hold menu probe",
@@ -210,6 +221,24 @@ struct PerformanceSettingsDetail: View {
                 .font(.system(size: 18))
                 .foregroundStyle(theme.palette.textTertiary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // The player cover belongs to RootView and can't present while this
+        // cover is up: dismiss first, launch from onDismiss.
+        .fullScreenCover(isPresented: $showTestStreams, onDismiss: {
+            guard let request = pendingTestStream else { return }
+            pendingTestStream = nil
+            TestStreamLauncher.shared.launch(request)
+        }) {
+            ZStack {
+                ATVBackground()
+                TestStreamsDetail { request in
+                    pendingTestStream = request
+                    showTestStreams = false
+                }
+            }
+            .environmentObject(theme)
+            .environmentObject(playerStore)
+            .onExitCommand { showTestStreams = false }
         }
     }
 

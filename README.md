@@ -122,6 +122,13 @@ Apple's public HLS test stream (`-playerDemoTour` walks the overlay states); `-d
 jumps straight to a Detail screen so cast/trailers/more-like-this enrichment is visible
 without navigating there by remote.
 
+On the box itself, **Settings → Performance → Developer → Test streams** plays public
+sample files through the selected engine: Dolby Vision 5 / 8.1 / 8.4, HDR10, HLG, AV1,
+TrueHD Atmos, DTS-HD MA, E-AC-3, PGS and ASS subtitles (Apple HLS examples, Jellyfin test
+videos, samples.ffmpeg.org), plus a field for any URL of your own — DV Profile 7 FEL,
+HDR10+ and DTS:X have no reliable public direct link. Test sessions never reach Continue
+Watching, Trakt or the add-on failover sweep.
+
 ## Known limitations
 
 - Torrent/`infoHash`-only streams are filtered out (no torrent engine on tvOS);

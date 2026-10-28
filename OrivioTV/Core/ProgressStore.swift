@@ -1148,6 +1148,8 @@ final class ProgressStore: ObservableObject {
     /// `save` is false for the in-`update` caller, which saves once at the end
     /// of its own body.
     func markFinished(meta: MetaItem, video: MetaVideo?, save shouldSave: Bool = true) {
+        // Dev test streams (Settings → Developer) are never watch history.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else { return }
         let key = Self.key(metaID: meta.id, video: video)
         AppProbe.data("cw finish \(meta.id) \(video?.seasonEpisodeCode ?? "")")
         // Finishing an episode is watching the show, so it lifts a previous
@@ -1214,7 +1216,8 @@ final class ProgressStore: ObservableObject {
         duration: Double,
         signature: StreamSignature? = nil
     ) {
-        guard duration.isFinite,
+        guard !TestStreamCatalog.isTestMeta(meta.id),
+              duration.isFinite,
               position.isFinite,
               duration > 60,
               duration <= Self.maxProgressSeconds,
@@ -1268,7 +1271,8 @@ final class ProgressStore: ObservableObject {
         duration: Double,
         signature: StreamSignature? = nil
     ) {
-        guard duration.isFinite,
+        guard !TestStreamCatalog.isTestMeta(meta.id),
+              duration.isFinite,
               position.isFinite,
               duration > 60,
               duration <= Self.maxProgressSeconds,
