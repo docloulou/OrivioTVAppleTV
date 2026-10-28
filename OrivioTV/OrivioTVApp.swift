@@ -1050,6 +1050,12 @@ struct RootView: View {
             }
         }
         .onChange(of: playback?.id) { _, _ in scrobbleForPlaybackChange() }
+        // Settings → Performance → Developer → Test streams.
+        .onReceive(TestStreamLauncher.shared.$pending) { request in
+            guard let request else { return }
+            TestStreamLauncher.shared.pending = nil
+            startPlayback(request)
+        }
         // Deep-link add-on install confirmation. A tvOS alert is fully
         // focusable and remote-navigable, and Cancel carries the `.cancel`
         // role so a Menu press is a REFUSAL — the safe default for a prompt
@@ -1935,6 +1941,11 @@ struct RootView: View {
 
     private func startScrobble(meta: MetaItem, video: MetaVideo?,
                                resumePosition: Double?, token: String) {
+        // A dev test stream has no title Trakt could know.
+        guard !TestStreamCatalog.isTestMeta(meta.id) else {
+            scrobblingItem = nil
+            return
+        }
         scrobblingItem = (meta, video)
         let startKey = ProgressStore.key(metaID: meta.id, video: video)
         // A re-watch starts fresh: last session's "finished" must not make
