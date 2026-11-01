@@ -631,7 +631,14 @@ struct RouteDestination: View {
     var body: some View {
         Group {
             switch route {
-            case .detail(let meta, let siblings): DetailView(meta: meta, siblings: siblings)
+            case .detail(let meta, let siblings):
+                // An add-on's collection item (AIOMetadata's "Netflix") is a
+                // set of catalogs, not a title: it opens as a Collection page.
+                if AddonCollectionScreen.handles(meta) {
+                    AddonCollectionScreen(meta: meta)
+                } else {
+                    DetailView(meta: meta, siblings: siblings)
+                }
             case .streams(let req): StreamsView(request: req)
             case .collection(let id): CollectionScreen(collectionID: id)
             case .person(let id, let name): PersonView(personID: id, name: name)
