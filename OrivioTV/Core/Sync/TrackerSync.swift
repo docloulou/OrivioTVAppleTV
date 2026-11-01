@@ -211,6 +211,10 @@ enum TraktSync {
 struct SimklSession: Codable, Equatable {
     var accessToken: String
     var username: String?
+    /// AUTH V2 tokens expire; these renew them (`SimklService.validToken`).
+    /// Nil for a legacy PIN-flow token, which does not expire.
+    var refreshToken: String? = nil
+    var expiresAt: Date? = nil
 }
 
 /// SIMKL login per profile (PIN flow, client id only).
@@ -242,34 +246,152 @@ enum SimklService {
     static var clientID: String { Secrets.simklClientID }
     static var isConfigured: Bool { !clientID.isEmpty }
 
-    struct PinInfo { var userCode: String; var url: String; var interval: TimeInterval; var expiresAt: Date }
+    /// `deviceCode` is set for an AUTH V2 device flow and nil for the legacy
+    /// PIN flow; `poll` follows whichever one `startPin` opened.
+    struct PinInfo {
+        var userCode: String
+        var url: String
+        var interval: TimeInterval
+        var expiresAt: Date
+        var deviceCode: String? = nil
+    }
+
+    /// SIMKL asks every request to name the app: `client_id`, `app-name`
+    /// and `app-version` on the URL and a User-Agent. Requests without them
+    /// are answered 400 for API apps created recently.
+    private static let appName = "orivio-tvos"
+    private static var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    }
+    private static func identified(_ path: String) -> URL? {
+        guard var components = URLComponents(string: base + path) else { return nil }
+        var items = components.queryItems ?? []
+        if !items.contains(where: { $0.name == "client_id" }) { items.append(URLQueryItem(name: "client_id", value: clientID)) }
+        items.append(URLQueryItem(name: "app-name", value: appName))
+        items.append(URLQueryItem(name: "app-version", value: appVersion))
+        components.queryItems = items
+        return components.url
+    }
+    private static var userAgent: String { "OrivioTV/\(appVersion)" }
 
     private static func get(_ path: String, token: String?) async throws -> Any {
-        guard let url = URL(string: base + path) else { throw HTTPError.badURL(path) }
-        var h = ["simkl-api-key": clientID, "Content-Type": "application/json"]
+        guard let url = identified(path) else { throw HTTPError.badURL(path) }
+        var h = ["simkl-api-key": clientID, "Content-Type": "application/json", "User-Agent": userAgent]
         if let token { h["Authorization"] = "Bearer \(token)" }
         let (d, _) = try await HTTP.data(HTTP.request(url, headers: h, fresh: true, timeout: 30), session: HTTP.ephemeral)
         return (try? JSONSerialization.jsonObject(with: d)) ?? [:]
     }
 
+    /// A form POST to the OAuth 2.0 endpoints, answered with its status and
+    /// body whatever the status: the device-token poll reads its 400s.
+    private static func postForm(_ path: String, _ fields: [String: String]) async throws -> (status: Int, body: [String: Any]) {
+        guard let url = URL(string: base + path) else { throw HTTPError.badURL(path) }
+        let form = fields.sorted { $0.key < $1.key }.map { key, value in
+            "\(key)=\(value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value)"
+        }.joined(separator: "&")
+        let request = HTTP.request(url, method: "POST",
+                                   headers: ["Content-Type": "application/x-www-form-urlencoded",
+                                             "Accept": "application/json", "User-Agent": userAgent],
+                                   body: Data(form.utf8), fresh: true, timeout: 30)
+        let (data, response) = try await HTTP.ephemeral.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        return (status, (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:])
+    }
+
+    /// The redirect URI a legacy PIN-flow app is usually registered with.
+    private static let oobRedirect = "urn:ietf:wg:oauth:2.0:oob"
+
     static func startPin() async throws -> PinInfo {
-        // Do NOT send `redirect`: this API key registers no redirect URI, and
-        // SIMKL answers every /oauth/pin with 403 "invalid redirect_uri" if one
-        // is present. The PIN flow doesn't need it (the user enters the code).
-        let obj = try await get("/oauth/pin?client_id=\(HTTP.encodeComponent(clientID))", token: nil) as? [String: Any] ?? [:]
+        // AUTH V2 FIRST. SIMKL's current API apps sign in with the OAuth 2.0
+        // device flow (RFC 8628) and refuse the legacy PIN endpoint with a
+        // 400; an app made before it answers the device endpoint with 404 or
+        // 401 "invalid_client", which is when the legacy flow is used.
+        let device = try await postForm("/oauth2/device", ["client_id": clientID, "scope": "media:read media:write"])
+        if (200..<300).contains(device.status), let code = device.body["user_code"] as? String, !code.isEmpty {
+            let link = device.body["verification_uri_complete"] as? String
+                ?? device.body["verification_uri"] as? String ?? "https://simkl.com/pin"
+            return PinInfo(userCode: code, url: link,
+                           interval: TimeInterval(device.body["interval"] as? Int ?? 5),
+                           expiresAt: Date().addingTimeInterval(TimeInterval(device.body["expires_in"] as? Int ?? 900)),
+                           deviceCode: device.body["device_code"] as? String)
+        }
+
+        // LEGACY PIN FLOW. Whether to send `redirect` depends on the app: one
+        // registered with no redirect URI answers 403 when it is present, one
+        // registered with the out-of-band URI answers 400 when it is missing.
+        let pinPath = "/oauth/pin?client_id=\(HTTP.encodeComponent(clientID))"
+        let obj: [String: Any]
+        do {
+            obj = try await get(pinPath, token: nil) as? [String: Any] ?? [:]
+        } catch HTTPError.status(let code) where code == 400 || code == 403 {
+            obj = try await get(pinPath + "&redirect=\(HTTP.encodeComponent(oobRedirect))", token: nil) as? [String: Any] ?? [:]
+        }
         guard let code = obj["user_code"] as? String else { throw HTTPError.notJSON }
         return PinInfo(userCode: code, url: obj["verification_url"] as? String ?? "https://simkl.com/pin",
                        interval: TimeInterval(obj["interval"] as? Int ?? 5), expiresAt: Date().addingTimeInterval(TimeInterval(obj["expires_in"] as? Int ?? 900)))
     }
 
-    static func poll(_ pin: PinInfo) async throws -> String {
+    static func poll(_ pin: PinInfo) async throws -> SimklSession {
+        var interval = pin.interval
         while Date() < pin.expiresAt {
             try Task.checkCancellation()
-            try await Task.sleep(nanoseconds: UInt64(pin.interval * 1_000_000_000))
-            if let obj = try? await get("/oauth/pin/\(pin.userCode)?client_id=\(clientID)", token: nil) as? [String: Any],
-               (obj["result"] as? String) == "OK", let token = obj["access_token"] as? String { return token }
+            try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            if let deviceCode = pin.deviceCode {
+                guard let reply = try? await postForm("/oauth2/token", [
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": clientID, "device_code": deviceCode,
+                ]) else { continue }
+                if (200..<300).contains(reply.status), let session = session(from: reply.body) {
+                    return session
+                }
+                switch reply.body["error"] as? String {
+                case "authorization_pending", nil: continue
+                case "slow_down": interval = min(interval + 5, 60)
+                case "expired_token": throw HTTPError.other("The code expired. Start a new SIMKL code.")
+                case "access_denied": throw HTTPError.other("The SIMKL sign-in was declined.")
+                case let other?: throw HTTPError.other("SIMKL: \(other)")
+                }
+            } else if let obj = try? await get("/oauth/pin/\(pin.userCode)?client_id=\(clientID)", token: nil) as? [String: Any],
+                      (obj["result"] as? String) == "OK", let token = obj["access_token"] as? String {
+                return SimklSession(accessToken: token)
+            }
         }
         throw HTTPError.other("The code expired. Start a new SIMKL code.")
+    }
+
+    /// A token response as a session. `expires_in` is in seconds.
+    private static func session(from body: [String: Any], keeping old: SimklSession? = nil) -> SimklSession? {
+        guard let token = body["access_token"] as? String, !token.isEmpty else { return nil }
+        let lifetime = (body["expires_in"] as? Int).map(TimeInterval.init)
+        return SimklSession(accessToken: token, username: old?.username,
+                            refreshToken: body["refresh_token"] as? String ?? old?.refreshToken,
+                            expiresAt: lifetime.map { Date().addingTimeInterval($0) })
+    }
+
+    /// The signed-in profile's access token, renewed first when it expires
+    /// within a minute. Nil when signed out, or when SIMKL refused the
+    /// renewal — the session is dropped then, so Settings offers Connect
+    /// again rather than syncing with a dead token.
+    static func validToken() async -> String? {
+        let store = AppStores.shared.simkl
+        guard let current = store.session else { return nil }
+        guard let expiresAt = current.expiresAt, expiresAt.timeIntervalSinceNow < 60 else {
+            return current.accessToken
+        }
+        guard let refresh = current.refreshToken, !refresh.isEmpty else { return current.accessToken }
+        guard let reply = try? await postForm("/oauth2/token", [
+            "grant_type": "refresh_token", "client_id": clientID, "refresh_token": refresh,
+        ]) else { return current.accessToken }   // offline: try the old one
+        if (200..<300).contains(reply.status), let renewed = session(from: reply.body, keeping: current) {
+            store.set(renewed)
+            return renewed.accessToken
+        }
+        if reply.status == 400 || reply.status == 401 {
+            store.set(nil)
+            store.lastError = "SIMKL signed you out (\(reply.body["error"] as? String ?? "HTTP \(reply.status)")). Connect again."
+            return nil
+        }
+        return current.accessToken
     }
 
     static func username(_ token: String) async -> String? {
@@ -281,7 +403,7 @@ enum SimklService {
     /// bucket and transformed off the main actor (huge libraries jetsammed the app).
     static func sync() async {
         let stores = AppStores.shared
-        guard let token = stores.simkl.session?.accessToken else { return }
+        guard let token = await validToken() else { return }
         let flags = stores.simklFlags.value
         do {
             let raw = try await get("/sync/all-items/?extended=full&episode_watched_at=yes", token: token)

@@ -726,9 +726,9 @@ private struct TrackerSettings: View {
             do {
                 let pin = try await SimklService.startPin()
                 f.url = pin.url; f.code = pin.userCode; f.status = "Waiting for you to approve…"
-                let token = try await SimklService.poll(pin)
-                let name = await SimklService.username(token)
-                simkl.set(SimklSession(accessToken: token, username: name))
+                var session = try await SimklService.poll(pin)
+                session.username = await SimklService.username(session.accessToken)
+                simkl.set(session)
                 flow = nil
                 ToastCenter.shared.show("SIMKL connected")
                 Task { await SimklService.sync() }
