@@ -31,7 +31,11 @@ struct PosterCard: View {
     #if DEBUG
     private static let noStrip = PerformanceProfile.arguments.contains("-noCardStrip")
     #endif
-    private var imageURL: String? { landscape ? (meta.background ?? meta.poster) : meta.poster }
+    private var imageURL: String? {
+        guard landscape else { return meta.poster }
+        // A poster the add-on drew wide IS the landscape art.
+        return meta.hasLandscapePoster ? meta.poster : (meta.background ?? meta.poster)
+    }
 
     var body: some View {
         #if DEBUG
@@ -83,7 +87,9 @@ struct PosterCard: View {
                 RemoteImage(url: imageURL, maxPixel: landscape ? ImageSize.landscape : ImageSize.poster,
                             fallbackURL: landscape ? meta.poster : meta.background)
                     .frame(width: width, height: height)
-                if landscape || meta.poster == nil {
+                // A wide add-on poster carries its own title; writing ours
+                // over it doubled it.
+                if (landscape && !meta.hasLandscapePoster) || meta.poster == nil {
                     LinearGradient(colors: [.clear, .black.opacity(0.6)], startPoint: .center, endPoint: .bottom)
                     LogoOrTitle(logo: landscape ? meta.logo : nil, title: meta.name,
                                 maxSize: CGSize(width: width * 0.7, height: height * 0.35), fallbackStyle: .cardTitle)

@@ -340,3 +340,66 @@ private struct CollectionTabStrip: View {
         #endif
     }
 }
+
+/// An add-on's collection item opened — "Netflix" in AIOMetadata's Streaming
+/// Services, "1990s" in its Decades. It is not a title but a set of the
+/// add-on's own catalogs (`meta.collection.sources`), so it opens as a
+/// Collection page: one tab per catalog plus All, built here and kept out of
+/// the user's library.
+struct AddonCollectionScreen: View {
+    let meta: MetaItem
+
+    @EnvironmentObject private var collections: CollectionsStore
+    @EnvironmentObject private var addons: AddonManager
+    @State private var collectionID: String?
+    @State private var failed = false
+
+    /// Our own collections and folders also travel as `type: "collection"`
+    /// (`collection:` / `folder:` ids); those keep their existing routes.
+    static func handles(_ meta: MetaItem) -> Bool {
+        meta.type == "collection" && !meta.id.hasPrefix("collection:") && !meta.id.hasPrefix("folder:")
+    }
+
+    var body: some View {
+        Group {
+            if let collectionID {
+                CollectionScreen(collectionID: collectionID)
+            } else {
+                VStack(spacing: 16) {
+                    if failed {
+                        Text(meta.name.isEmpty ? "Collection" : meta.name).textStyle(.pageTitle)
+                        Text("This add-on sent nothing to show for it.").textStyle(.meta)
+                    } else {
+                        ProgressView()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: meta.id) { await load() }
+    }
+
+    private func load() async {
+        let id = "addon-collection:\(meta.id)"
+        if collections.addonCollections[id] != nil { collectionID = id; return }
+        for addon in addons.enabled where addon.manifest.handles("meta", type: "collection", id: meta.id) {
+            guard let sources = try? await AddonClient.collectionSources(addon, id: meta.id), !sources.isEmpty
+            else { continue }
+            var collection = OrivioCollection(id: id, title: meta.name)
+            collection.backdropImageUrl = meta.background
+            collection.viewMode = "TABBED_GRID"
+            collection.showAllTab = true
+            collection.folders = sources.map { source in
+                let catalog = addon.manifest.catalogs.first { $0.id == source.catalogId && $0.type == source.type }
+                var folder = CollectionFolder(title: catalog.map { $0.name.isEmpty ? $0.id : $0.name } ?? source.catalogId)
+                folder.id = "\(source.type)|\(source.catalogId)"
+                folder.sources = [.addon(addon.manifest.id, type: source.type, catalogId: source.catalogId)]
+                return folder
+            }
+            collections.registerAddonCollection(collection)
+            collectionID = id
+            return
+        }
+        failed = true
+    }
+}
