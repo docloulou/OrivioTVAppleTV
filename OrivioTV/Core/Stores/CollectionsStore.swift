@@ -247,7 +247,16 @@ final class CollectionsStore: ObservableObject {
 
     /// One visible collection (cheap: served from the memo).
     func visibleCollection(_ id: String, for profile: Profile) -> OrivioCollection? {
-        visible(for: profile).first { $0.id == id }
+        addonCollections[id] ?? visible(for: profile).first { $0.id == id }
+    }
+
+    /// Collections an add-on serves (AIOMetadata's "Netflix", "Decades"…),
+    /// built when one is opened so the Collection page can show them. Never
+    /// saved, synced or listed: they belong to the add-on, not the library.
+    private(set) var addonCollections: [String: OrivioCollection] = [:]
+
+    func registerAddonCollection(_ collection: OrivioCollection) {
+        addonCollections[collection.id] = collection
     }
 
     private func computeVisible(for profile: Profile) -> [OrivioCollection] {

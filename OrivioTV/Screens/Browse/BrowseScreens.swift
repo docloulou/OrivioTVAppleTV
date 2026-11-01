@@ -15,11 +15,15 @@ struct PosterGrid: View {
     @EnvironmentObject private var watched: WatchedStore
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 240, maximum: 240), spacing: 40, alignment: .top)], alignment: .leading, spacing: 60) {
+        // Wide when the add-on drew every item wide (see `CatalogRow`).
+        let landscape = !items.isEmpty && items.allSatisfy(\.hasLandscapePoster)
+        let width: CGFloat = landscape ? 400 : 240
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: width, maximum: width), spacing: 40, alignment: .top)], alignment: .leading, spacing: 60) {
             ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
                 let actions = PlayActions(router: router)
                 Button { actions.openDetail(item, siblings: items) } label: {
-                    PosterCard(meta: item, watched: item.isMovie && watched.isWatched(item.id))
+                    PosterCard(meta: item, width: width, landscape: landscape,
+                               watched: item.isMovie && watched.isWatched(item.id))
                 }
                 .buttonStyle(FlatCardStyle())
                 .onPlayPauseCommand { actions.playManually(item) }

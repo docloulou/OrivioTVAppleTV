@@ -109,6 +109,33 @@ enum AddonClient {
         return meta
     }
 
+    // MARK: Collections
+
+    /// One catalog an add-on collection is made of.
+    struct CollectionSourceRef: Decodable, Hashable {
+        let type: String
+        let catalogId: String
+    }
+
+    private struct CollectionMetaResponse: Decodable {
+        struct Meta: Decodable {
+            struct Collection: Decodable { let sources: [CollectionSourceRef]? }
+            let collection: Collection?
+        }
+        let meta: Meta?
+    }
+
+    /// What an add-on collection item opens onto — "Netflix" in AIOMetadata's
+    /// Streaming Services: `meta.collection.sources`, catalogs of the same
+    /// add-on. The catalog row sends the item with an empty `collection`, so
+    /// the list only comes from the item's own meta. Empty when there is none.
+    static func collectionSources(_ addon: InstalledAddon, id: String) async throws -> [CollectionSourceRef] {
+        let path = "\(addon.baseURL)/meta/collection/\(HTTP.encodeComponent(id)).json"
+        guard let url = URL(string: path) else { throw HTTPError.badURL(addon.baseURL) }
+        let response = try await HTTP.json(CollectionMetaResponse.self, url: url, timeout: 20)
+        return response.meta?.collection?.sources ?? []
+    }
+
     // MARK: Streams (never cached)
 
     static func streams(_ addon: InstalledAddon, type: String, id: String, timeout: TimeInterval) async throws -> [Stream] {
