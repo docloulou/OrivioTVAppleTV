@@ -174,6 +174,11 @@ struct MetaItem: Codable, Hashable, Identifiable {
     var posterShape: String?
     var tmdbID: Int?
 
+    /// The add-on drew this item's poster wide (`posterShape: "landscape"`):
+    /// AIOMetadata's collection tiles, say, whose artwork already carries the
+    /// service's branding. Shown as it is, never cropped to portrait.
+    var hasLandscapePoster: Bool { posterShape?.lowercased() == "landscape" }
+
     init(id: String, type: String, name: String, poster: String? = nil, posterFallback: String? = nil,
          background: String? = nil, logo: String? = nil, description: String? = nil, releaseInfo: String? = nil,
          released: Date? = nil, imdbRating: String? = nil, runtime: String? = nil, genres: [String] = [],

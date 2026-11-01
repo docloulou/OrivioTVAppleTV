@@ -187,7 +187,11 @@ struct CatalogRow: View {
         #if DEBUG
         let _ = BodyCounter.hit("CatalogRow")
         #endif
+        // A row the add-on drew wide (every item `posterShape: landscape`)
+        // shows wide whatever the poster setting: cropped to portrait, its
+        // tiles lost their artwork and the text drawn into it.
         let landscape = home.value.landscapePosters
+            || (!row.items.isEmpty && row.items.allSatisfy(\.hasLandscapePoster))
         let labels = home.value.posterLabels
         FocusRow(rowKey: row.id, title: row.descriptor.title, iconURL: row.descriptor.addonLogo,
                  onSeeAll: seeAll, seeAllSize: landscape ? CGSize(width: 400, height: 225) : CGSize(width: 240, height: 360),
